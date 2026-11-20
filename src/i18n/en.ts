@@ -6,6 +6,22 @@ export const androidWelcomeMessages = [
 ] as const
 
 export const en = {
+  searchModeLabel: 'Smart search',
+  callInProgress: 'In call {time}',
+  callInterrupt: 'Speak or tap to interrupt',
+  callListening: 'Listening',
+  callThinking: 'Thinking',
+  callSpeaking: 'Answering',
+  callMuted: 'You are muted',
+  callMute: 'Mute',
+  callUnmute: 'Unmute',
+  callEnd: 'Hang up',
+  callVoiceMode: 'Back to voice',
+  callTextMode: 'Switch to text',
+  callVoiceTitle: 'Voice',
+  callVoiceSweet: 'Playful and sweet',
+  callVoiceDeep: 'Low and warm',
+  callAnswerSettings: 'Answer settings',
   androidMessageHint: 'Send a message',
   androidHoldHint: 'Send a message or hold to talk',
   androidHoldToTalk: 'Hold to talk',

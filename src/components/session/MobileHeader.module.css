@@ -41,3 +41,8 @@
   width: 22px;
   height: 22px;
 }
+
+/* 语音通话入口：与朗读按钮同尺寸，靠右排列 */
+.call {
+  margin: 0 2px;
+}

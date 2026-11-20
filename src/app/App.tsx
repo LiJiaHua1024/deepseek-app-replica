@@ -21,6 +21,7 @@ import { SettingsDialog } from '../components/settings/SettingsDialog.js'
 import { AndroidSettings } from '../components/settings/AndroidSettings.js'
 import { ApiKeyScreen } from '../components/settings/ApiKeyScreen.js'
 import { Toast } from '../components/base/Toast.js'
+import { VoiceCallScreen } from '../components/call/VoiceCallScreen.js'
 import { showToast } from '../components/base/toastState.js'
 import { onUploadNotice } from '../services/attachments.js'
 import { Button } from '../components/base/Button.js'
@@ -204,6 +205,7 @@ export const App = () => {
       </div>
       {android ? <AndroidSettings chatFrame={frameRef} /> : <SettingsDialog />}
       <Toast />
+      <VoiceCallScreen />
     </>
   )
 }

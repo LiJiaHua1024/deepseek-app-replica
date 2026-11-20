@@ -5,6 +5,22 @@ export const androidWelcomeMessages = [
 ] as const
 
 export const zh = {
+  searchModeLabel: '智能搜索',
+  callInProgress: '通话中 {time}',
+  callInterrupt: '说话或轻触打断',
+  callListening: '正在聆听',
+  callThinking: '正在思考',
+  callSpeaking: '正在回答',
+  callMuted: '你已静音',
+  callMute: '静音',
+  callUnmute: '取消静音',
+  callEnd: '挂断',
+  callVoiceMode: '回到语音',
+  callTextMode: '切换到文字',
+  callVoiceTitle: '朗读音色',
+  callVoiceSweet: '俏皮甜美',
+  callVoiceDeep: '低沉浑厚',
+  callAnswerSettings: '回答设置',
   welcomeMessageChat250808: '今天有什么可以帮到你？',
   androidMessageHint: '发消息',
   androidHoldHint: '发消息或按住说话',
