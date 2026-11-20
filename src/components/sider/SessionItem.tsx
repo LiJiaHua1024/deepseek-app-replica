@@ -7,6 +7,8 @@ import { renameSession, selectSession } from '../../services/chat/store.js'
 import type { SessionSummary } from '../../services/chat/types.js'
 import { IconButton } from '../base/IconButton.js'
 import { Menu } from '../base/Menu.js'
+import { useSettings } from '../../services/settings.js'
+import { SessionDetailSheet } from './SessionDetailSheet.js'
 import { closeMobileSider } from './mobileSiderState.js'
 import styles from './SessionItem.module.css'
 
@@ -22,7 +24,10 @@ export const SessionItem = memo(function SessionItem({
   selection?: { checked: boolean; toggle: () => void }
 }) {
   const t = useTranslate()
+  const locale = useSettings((state) => state.locale)
+  const tr = (chinese: string, english: string) => (locale === 'zh-CN' ? chinese : english)
   const [editing, setEditing] = useState(false)
+  const [detail, setDetail] = useState(false)
   const actionsRef = useRef<HTMLDivElement>(null)
   const displayTitle = session.title || t('untitledChat')
 
@@ -85,6 +90,18 @@ export const SessionItem = memo(function SessionItem({
         <Menu
           options={[
             {
+              key: 'detail',
+              label: tr('详情', 'Details'),
+              icon: (
+                <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4">
+                  <circle cx="8" cy="8" r="6.2" />
+                  <path d="M8 7.2v4" strokeLinecap="round" />
+                  <circle cx="8" cy="4.9" r="0.85" fill="currentColor" stroke="none" />
+                </svg>
+              ),
+              onSelect: () => setDetail(true),
+            },
+            {
               key: 'rename',
               label: t('sessionItemMenuRenameOption'),
               icon: <IconEditOutline16 />,
@@ -104,6 +121,7 @@ export const SessionItem = memo(function SessionItem({
           )}
         </Menu>
       </div>
+      {detail ? <SessionDetailSheet session={session} onClose={() => setDetail(false)} /> : null}
     </div>
   )
 })
