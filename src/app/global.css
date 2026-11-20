@@ -59,3 +59,9 @@ body.change-theme *::after {
     overscroll-behavior-y: none;
   }
 }
+
+/* 搜索跳转时标出命中的关键词 */
+::highlight(dsh-search-hit) {
+  background-color: rgb(77 107 254 / 32%);
+  color: inherit;
+}

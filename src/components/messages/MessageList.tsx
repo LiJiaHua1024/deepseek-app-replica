@@ -27,6 +27,10 @@ const getUploadRetryId = (messages: Message[], streaming: boolean) => {
     ? last.id
     : null
 }
+import {
+  clearScrollTarget,
+  useScrollTarget,
+} from '../../services/chat/scrollTarget.js'
 import styles from './MessageList.module.css'
 
 /** 距底部小于该值时视为在底部，流式内容增长时跟随 */
@@ -52,6 +56,7 @@ export const MessageList = ({
   const scrollTopRef = useRef(0)
   const restoreScrollRef = useRef<{ messageId: string; top: number } | null>(null)
   const messages = useMemo(() => getVisibleMessages(session), [session])
+  const scrollTarget = useScrollTarget((state) => state.target)
   const latestStart = Math.max(0, messages.length - INITIAL_MESSAGES)
   const [messageWindow, setMessageWindow] = useState({ sessionId: session.id, start: latestStart })
   const start =
@@ -141,6 +146,99 @@ export const MessageList = ({
       scroll.removeEventListener('scroll', loadOlder)
     }
   }, [isMobile, session.id, start])
+
+  // 搜索命中后跳转：窗口没覆盖到目标就先补齐，再把它滚到视口上方三分之一处并标出关键词。
+  useLayoutEffect(() => {
+    if (!scrollTarget || scrollTarget.sessionId !== session.id) {
+      return
+    }
+    const index = messages.findIndex((message) => message.id === scrollTarget.messageId)
+    if (index < 0) {
+      clearScrollTarget()
+      return
+    }
+    // 目标还在窗口之外：先把窗口扩到包含它，渲染后本效应会再跑一次
+    if (index < start) {
+      stickyRef.current = false
+      setMessageWindow({ sessionId: session.id, start: Math.max(0, index - 2) })
+      return
+    }
+    const scroller = scrollRef.current
+    if (!scroller) {
+      return
+    }
+    const messageId = scrollTarget.messageId
+    const term = scrollTarget.term
+    stickyRef.current = false
+    clearScrollTarget()
+
+    const markTerm = (node: HTMLElement) => {
+      const highlightApi = window as unknown as {
+        Highlight?: new (range: Range) => unknown
+        CSS?: { highlights?: Map<string, unknown> }
+      }
+      if (!term || !highlightApi.Highlight || !highlightApi.CSS?.highlights) {
+        return
+      }
+      const walker = document.createTreeWalker(node, NodeFilter.SHOW_TEXT)
+      let text = ''
+      const nodes: { node: Text; start: number }[] = []
+      let current = walker.nextNode()
+      while (current) {
+        const textNode = current as Text
+        nodes.push({ node: textNode, start: text.length })
+        text += textNode.data
+        current = walker.nextNode()
+      }
+      const found = text.toLocaleLowerCase().indexOf(term.toLocaleLowerCase())
+      if (found < 0) {
+        return
+      }
+      const locate = (offset: number) => {
+        for (let i = nodes.length - 1; i >= 0; i -= 1) {
+          if (offset >= nodes[i].start) {
+            return { node: nodes[i].node, offset: offset - nodes[i].start }
+          }
+        }
+        return { node: nodes[0].node, offset: 0 }
+      }
+      try {
+        const from = locate(found)
+        const to = locate(found + term.length)
+        const range = document.createRange()
+        range.setStart(from.node, Math.min(from.offset, from.node.data.length))
+        range.setEnd(to.node, Math.min(to.offset, to.node.data.length))
+        highlightApi.CSS.highlights.set('dsh-search-hit', new highlightApi.Highlight(range))
+        window.setTimeout(() => highlightApi.CSS?.highlights?.delete('dsh-search-hit'), 2600)
+      } catch {
+        // 定位失败不影响滚动
+      }
+    }
+
+    const align = () => {
+      const node = scroller.querySelector<HTMLElement>(
+        `[data-message-id="${CSS.escape(messageId)}"]`
+      )
+      if (!node || !scroller.isConnected) {
+        return
+      }
+      if (!node.classList.contains(styles.flash)) {
+        node.classList.add(styles.flash)
+        window.setTimeout(() => node.classList.remove(styles.flash), 1600)
+        markTerm(node)
+      }
+      const box = scroller.getBoundingClientRect()
+      const rect = node.getBoundingClientRect()
+      const top =
+        scroller.scrollTop + (rect.top - box.top) - box.height * 0.32
+      scroller.scrollTo({
+        top: Math.max(0, Math.min(scroller.scrollHeight - scroller.clientHeight, top)),
+        behavior: 'smooth',
+      })
+    }
+
+    ;[0, 80, 240, 520].forEach((delay) => window.setTimeout(align, delay))
+  }, [scrollTarget, session.id, messages, start])
 
   // 切换版本后将选择器留在原位置，避免回答长短变化导致操作区跳出视口。
   useLayoutEffect(() => {

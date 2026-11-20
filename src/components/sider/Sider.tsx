@@ -23,6 +23,7 @@ import { openSettings } from '../settings/settingsDialogState.js'
 import { closeMobileSider, useMobileSider } from './mobileSiderState.js'
 import { SessionItem } from './SessionItem.js'
 import { useSessionSearch } from './useSessionSearch.js'
+import { MessageSearchPage } from '../search/MessageSearchPage.js'
 import styles from './Sider.module.css'
 
 const ROW_OVERSCAN = 8
@@ -36,7 +37,8 @@ export const Sider = memo(function Sider({ mobile = false }: { mobile?: boolean 
   const profile = useSettings((state) => state.accountProfile)
   const username = profile.username || t('profileDefaultUsername')
   const androidDrawer = Boolean(mobile && android)
-  const [query, setQuery] = useState('')
+  const [query] = useState('')
+  const [searchOpen, setSearchOpen] = useState(false)
   const matches = useSessionSearch(query, sessions)
   const [now, setNow] = useState(Date.now)
   const [selecting, setSelecting] = useState(false)
@@ -151,8 +153,10 @@ export const Sider = memo(function Sider({ mobile = false }: { mobile?: boolean 
             type="search"
             placeholder={t('androidSearchChats')}
             aria-label={t('androidSearchChats')}
-            value={query}
-            onChange={(event) => setQuery(event.target.value)}
+            value=""
+            readOnly
+            onFocus={() => setSearchOpen(true)}
+            onClick={() => setSearchOpen(true)}
           />
         </label>
       ) : (
@@ -380,6 +384,7 @@ export const Sider = memo(function Sider({ mobile = false }: { mobile?: boolean 
           {t('deleteSessionWithFilesDescription')}
         </Modal>
       ) : null}
+      <MessageSearchPage open={searchOpen} onClose={() => setSearchOpen(false)} />
     </div>
   )
 })
