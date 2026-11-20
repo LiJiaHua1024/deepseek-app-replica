@@ -115,6 +115,15 @@ export type ContextCheckpoint = {
   offset?: number
 }
 
+/** 事实账本的一块：覆盖一段轮次，写入后不再修改（保证请求前缀稳定） */
+export type MemoryLedgerBlock = {
+  index: number
+  fromRound: number
+  toRound: number
+  text: string
+  createdAt: number
+}
+
 export type Session = {
   id: string
   title: string
@@ -125,6 +134,8 @@ export type Session = {
   /** undefined 表示线性消息列表；null 表示空会话。 */
   rootMessageId?: string | null
   contextCheckpoints?: ContextCheckpoint[]
+  /** 只追加的事实账本，与滚动摘要并存 */
+  memoryLedger?: MemoryLedgerBlock[]
 }
 
 /** 会话列表元数据；消息只在打开会话时加载。 */

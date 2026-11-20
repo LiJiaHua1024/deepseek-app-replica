@@ -33,6 +33,11 @@ import {
   includeContextSummary,
   summarizeCurrentInput,
 } from './contextSummary.js'
+import {
+  createMemoryBlock,
+  nextMemoryRange,
+  withMemoryLedger,
+} from './memoryLedger.js'
 import { prepareCustomAttachments } from './customAttachments.js'
 import * as db from './db.js'
 import {
@@ -1242,7 +1247,7 @@ const streamReply = async (sessionId: string, initial: AssistantMessage, request
         const body: CreateMessageRequest = {
           model: reply.model ?? DEFAULT_CHAT_MODEL,
           max_tokens: maxOutputTokens,
-          system: custom ? '' : SYSTEM_PROMPT,
+          system: custom ? '' : withMemoryLedger(SYSTEM_PROMPT, get().sessionCache[sessionId]?.memoryLedger),
           messages,
           thinking: { type: initial.thinking ? 'enabled' : 'disabled' },
           safety_check: SAFETY_CHECK,
@@ -1383,5 +1388,31 @@ const streamReply = async (sessionId: string, initial: AssistantMessage, request
       ),
     }))
     persist(sessionId)
+    void appendMemoryBlock(sessionId)
   }
+}
+
+/** 每满 MEMORY_BLOCK_ROUNDS 轮追加一块账本；失败静默，下次再补 */
+const appendMemoryBlock = async (sessionId: string) => {
+  const session = get().sessionCache[sessionId]
+  if (!session) {
+    return
+  }
+  const range = nextMemoryRange(session)
+  if (!range) {
+    return
+  }
+  const block = await createMemoryBlock(session, range, useSettings.getState().apiKey ?? '')
+  if (!block) {
+    return
+  }
+  updateSession(sessionId, (current) => {
+    const blocks = current.memoryLedger ?? []
+    // 期间可能已经补过一块，避免重复追加同一段
+    if (blocks.some((item) => item.toRound >= block.toRound)) {
+      return current
+    }
+    return { ...current, memoryLedger: [...blocks, block] }
+  })
+  persist(sessionId)
 }
