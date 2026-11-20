@@ -5,6 +5,10 @@ export const androidWelcomeMessages = [
 ] as const
 
 export const zh = {
+  historyImportFromLink: '从链接导入',
+  historyImportLinkHint: '粘贴 DeepSeek 导出的下载链接，由应用自行下载并导入。',
+  historyImportLinkLabel: '导出链接',
+  historyImportDownloading: '正在下载导出包… {percent}%',
   searchModeLabel: '智能搜索',
   callInProgress: '通话中 {time}',
   callInterrupt: '说话或轻触打断',

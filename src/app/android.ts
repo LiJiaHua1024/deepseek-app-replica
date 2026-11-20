@@ -26,6 +26,12 @@ type AndroidBridge = {
   requestHistoryExport: (name: string) => void
   writeHistoryExport: (bytes: string) => boolean
   finishHistoryExport: () => boolean
+  /** 开始下载导出包，返回令牌；空串表示地址不可用 */
+  startHistoryDownload?: (address: string) => string
+  historyDownloadSize?: (token: string) => number
+  /** 按块读取（base64） */
+  readHistoryDownload?: (token: string, offset: number, length: number) => string
+  releaseHistoryDownload?: (token: string) => void
   beginImageSave: (name: string, mime: string) => boolean
   writeImageSave: (bytes: string) => boolean
   finishImageSave: (keep: boolean) => boolean

@@ -7,6 +7,7 @@ import {
 } from '../../app/useAndroidBackInterception.js'
 import { useTranslate, type LinkedMessage, type TranslationKey } from '../../i18n/index.js'
 import type { TtsVoice } from '../../services/api/speech.js'
+import { downloadArchive } from '../../services/chat/history/linkImport.js'
 import {
   BackupError,
   clearHistory,
@@ -81,7 +82,7 @@ type Page =
   | 'font'
   | 'personalization'
   | 'agreements'
-type Popup = 'locale' | 'theme' | 'voice' | 'logout' | 'delete' | 'import'
+type Popup = 'locale' | 'theme' | 'voice' | 'logout' | 'delete' | 'import' | 'link'
 
 const parentPage: Record<Page, Page | null> = {
   root: null,
@@ -274,6 +275,9 @@ const Settings = ({ start, chatFrame }: { start: Page; chatFrame: RefObject<HTML
   const [updateFallback, setUpdateFallback] = useState(false)
   const [file, setFile] = useState<File | null>(null)
   const [importStatus, setImportStatus] = useState<LinkedMessage | null>(null)
+  const [link, setLink] = useState('')
+  const [linkBusy, setLinkBusy] = useState(false)
+  const [linkPercent, setLinkPercent] = useState<number | null>(null)
   const [archive, setArchive] = useState<Awaited<ReturnType<typeof exportHistory>> | null>(null)
   const importInput = useRef<HTMLInputElement>(null)
   const pagesRef = useRef<HTMLDivElement>(null)
@@ -474,6 +478,38 @@ const Settings = ({ start, chatFrame }: { start: Page; chatFrame: RefObject<HTML
       })
     } finally {
       setBusy(false)
+    }
+  }
+
+  const importFromLink = async () => {
+    const value = link.trim()
+    if (!value || linkBusy) {
+      return
+    }
+    setLinkBusy(true)
+    setLinkPercent(0)
+    setImportStatus({ key: 'historyImporting' })
+    try {
+      const archive = await downloadArchive(value, (progress) => {
+        setLinkPercent(
+          progress.total > 0 ? Math.round((progress.loaded / progress.total) * 100) : null
+        )
+      })
+      const count = await importHistory(archive, setImportStatus)
+      setImportStatus({
+        key: count === 1 ? 'historyImportedOne' : 'historyImported',
+        params: { count },
+      })
+      setPopup(null)
+      setLink('')
+    } catch (error) {
+      setImportStatus({
+        key: error instanceof BackupError ? error.key : 'historyImportFailed',
+        type: 'error',
+      })
+    } finally {
+      setLinkBusy(false)
+      setLinkPercent(null)
     }
   }
 
@@ -726,6 +762,18 @@ const Settings = ({ start, chatFrame }: { start: Page; chatFrame: RefObject<HTML
                 }}
               />
             </Group>
+            <Group>
+              <Row
+                label={t('historyImportFromLink')}
+                arrow={false}
+                disabled={busy || linkBusy}
+                onClick={() => {
+                  setLink('')
+                  setLinkPercent(null)
+                  setPopup('link')
+                }}
+              />
+            </Group>
             {importStatus ? (
               <p
                 className={styles.caption}
@@ -948,6 +996,43 @@ const Settings = ({ start, chatFrame }: { start: Page; chatFrame: RefObject<HTML
             >
               {t('confirm')}
             </button>
+          </section>
+        </div>
+      ) : null}
+      {popup === 'link' ? (
+        <div className={styles.overlay}>
+          <section className={styles.choice} role="dialog" aria-modal="true">
+            <header>{t('historyImportFromLink')}</header>
+            <p className={styles.message}>{t('historyImportLinkHint')}</p>
+            <label className={styles.linkField}>
+              <span>{t('historyImportLinkLabel')}</span>
+              <textarea
+                value={link}
+                rows={3}
+                spellCheck={false}
+                autoCapitalize="off"
+                autoCorrect="off"
+                placeholder="https://…/deepseek_data-2026-01-01.zip?Signature=…"
+                onChange={(event) => setLink(event.target.value)}
+              />
+            </label>
+            {linkPercent !== null ? (
+              <p className={styles.message}>
+                {t('historyImportDownloading', { percent: linkPercent })}
+              </p>
+            ) : null}
+            <div className={styles.confirmActions}>
+              <button className={styles.confirm} disabled={linkBusy} onClick={back}>
+                {t('cancel')}
+              </button>
+              <button
+                className={styles.confirm}
+                disabled={linkBusy || !link.trim()}
+                onClick={() => void importFromLink()}
+              >
+                {t('historyImportConfirm')}
+              </button>
+            </div>
           </section>
         </div>
       ) : null}

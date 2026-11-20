@@ -66,6 +66,7 @@ public final class MainActivity extends Activity {
     private final InAppBackCallback inAppBack = new InAppBackCallback(this, this::handleBack,
         this::reportBackPreview);
     private final ExecutorService photoExecutor = Executors.newSingleThreadExecutor();
+    private final HistoryDownload historyDownload = new HistoryDownload();
 
     @Override
     public void onCreate(Bundle state) {
@@ -413,11 +414,20 @@ public final class MainActivity extends Activity {
         super.onStop();
     }
 
+    /** 下载进度事件：前端监听 android-download */
+    private void emitDownload(String state, long loaded, long total, String message) {
+        String script = "window.dispatchEvent(new CustomEvent('android-download',{detail:{"
+            + "state:'" + state + "',loaded:" + loaded + ",total:" + total
+            + ",message:'" + escapeJs(message) + "'}}))";
+        runOnUiThread(() -> webView.evaluateJavascript(script, null));
+    }
+
     @Override
     protected void onDestroy() {
         customChat.close();
         inAppBack.setEnabled(false);
         photoExecutor.shutdownNow();
+        historyDownload.shutdown();
         updater.close();
         if (fileCallback != null) fileCallback.onReceiveValue(null);
         recorder.finish(false);
@@ -557,6 +567,25 @@ public final class MainActivity extends Activity {
 
         @JavascriptInterface
         public boolean finishHistoryExport() { return historyExport.close(); }
+
+        /** 从链接下载导出包，返回令牌；进度通过 android-download 事件回传 */
+        @JavascriptInterface
+        public String startHistoryDownload(String address) {
+            return historyDownload.start(MainActivity.this, address,
+                (state, loaded, total, message) -> emitDownload(state, loaded, total, message));
+        }
+
+        @JavascriptInterface
+        public long historyDownloadSize(String token) { return historyDownload.size(token); }
+
+        /** 按块读取（base64），前端拼成 File 后交给现有导入管线 */
+        @JavascriptInterface
+        public String readHistoryDownload(String token, long offset, int length) {
+            return historyDownload.read(token, offset, length);
+        }
+
+        @JavascriptInterface
+        public void releaseHistoryDownload(String token) { historyDownload.release(token); }
 
         @JavascriptInterface
         public boolean beginImageSave(String name, String mime) { return imageSave.begin(name, mime); }

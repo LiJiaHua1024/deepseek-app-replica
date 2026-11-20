@@ -6,6 +6,10 @@ export const androidWelcomeMessages = [
 ] as const
 
 export const en = {
+  historyImportFromLink: 'Import from link',
+  historyImportLinkHint: 'Paste the download link from your DeepSeek export; the app fetches it for you.',
+  historyImportLinkLabel: 'Export link',
+  historyImportDownloading: 'Downloading archive… {percent}%',
   searchModeLabel: 'Smart search',
   callInProgress: 'In call {time}',
   callInterrupt: 'Speak or tap to interrupt',
