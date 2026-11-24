@@ -849,6 +849,12 @@ const Settings = ({ start, chatFrame }: { start: Page; chatFrame: RefObject<HTML
                   void runExportAction(async () => {
                     setExportSavedName(null)
                     const exported = await exportHistory()
+                    if (exported.skipped > 0) {
+                      showToast({
+                        key: 'historyExportSkipped',
+                        params: { count: exported.skipped },
+                      })
+                    }
                     if (android) {
                       if (await saveAndroidHistory(exported.name, exported.blob)) {
                         setExportSavedName(exported.name)

@@ -1,6 +1,6 @@
 import { readBlobChunks } from '../utils/blob.js'
 
-type AndroidBridge = {
+export type AndroidBridge = {
   statusInset: () => number
   buttonNavigationInset: () => number
   systemFontScale: () => number
@@ -35,6 +35,13 @@ type AndroidBridge = {
   requestHistoryExport: (name: string) => void
   writeHistoryExport: (bytes: string) => boolean
   finishHistoryExport: () => boolean
+  shadowBegin?: (path: string) => boolean
+  shadowAppend?: (bytes: string) => boolean
+  shadowFinish?: (keep: boolean) => boolean
+  shadowList?: (dir: 'sessions' | 'files') => string
+  shadowReadChunk?: (path: string, offset: number, maxBytes: number) => string | null
+  shadowDelete?: (path: string) => boolean
+  shadowClearAll?: () => boolean
   requestImageSavePermission?: () => void
   beginImageSave: (name: string, mime: string) => boolean
   writeImageSave: (bytes: string) => boolean

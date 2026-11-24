@@ -603,7 +603,10 @@ const ExportHistory = ({ disabled }: { disabled: boolean }) => {
     setBusy(true)
     setStatus(null)
     try {
-      const { name, blob } = await exportHistory()
+      const { name, blob, skipped } = await exportHistory()
+      if (skipped > 0) {
+        showToast({ key: 'historyExportSkipped', params: { count: skipped } })
+      }
       if (android) {
         await saveAndroidHistory(name, blob)
         return

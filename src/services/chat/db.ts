@@ -1,6 +1,7 @@
 import { openDB, type DBSchema, type IDBPDatabase, type IDBPTransaction } from 'idb'
 import { createId } from '../../utils/id.js'
 import { mergeSessions } from './history/mergeSessions.js'
+import * as shadow from './shadow.js'
 import { toSessionSummary, type Session, type SessionSummary } from './types.js'
 
 /** IndexedDB 存储结构版本；新增或调整存储、索引时递增。 */
@@ -62,6 +63,8 @@ interface ChatDB extends DBSchema {
 }
 
 let dbPromise: Promise<IDBPDatabase<ChatDB>> | null = null
+/** 本进程是否已成功打开过库；用于区分首装（oldVersion 0 正常）和运行期被外部清空重建。 */
+let openedOnce = false
 
 const storedSummary = (session: Session): StoredSessionSummary => {
   const fileIds = new Set<string>()
@@ -94,7 +97,12 @@ const getDB = () => {
     }
   }
   const opening = openDB<ChatDB>('chat-demo', DB_VERSION, {
-    upgrade(db, _oldVersion, _newVersion, tx) {
+    upgrade(db, oldVersion, _newVersion, tx) {
+      // 本进程已打开过库却又见 oldVersion 0：IndexedDB 被 Chromium/ROM 静默删库重建。
+      // 派发事件让上层从原生影子镜像恢复，不再静默新建空库掩盖事故。
+      if (oldVersion === 0 && openedOnce && typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('chat-storage-reset'))
+      }
       // 现有历史继续使用原来的存储，只有完成一次导入后才切换。
       for (const name of ['sessions', 'files', 'sessionsStaging', 'filesStaging'] as const) {
         if (!db.objectStoreNames.contains(name)) {
@@ -121,11 +129,16 @@ const getDB = () => {
       void opening.then((db) => db.close())
     },
     terminated: invalidate,
-  }).catch((error: unknown) => {
-    // 打开失败后允许界面重试，避免一直复用已拒绝的 Promise。
-    invalidate()
-    throw error
   })
+    .then((db) => {
+      openedOnce = true
+      return db
+    })
+    .catch((error: unknown) => {
+      // 打开失败后允许界面重试，避免一直复用已拒绝的 Promise。
+      invalidate()
+      throw error
+    })
   dbPromise = opening
   return opening
 }
@@ -241,11 +254,14 @@ export const saveSession = (session: Session, files: StoredFile[] = []): Promise
       tx.objectStore(stores.sessions).put(session),
       tx.objectStore(stores.summaries).put(summary),
     ])
+  }).then(() => {
+    shadow.mirrorSession(session, files)
   })
 
 /** 未打开的会话也可重命名，只读取该会话，原子更新详情和列表。 */
-export const renameSession = (id: string, title: string): Promise<void> =>
-  withActive('readwrite', async (tx, { slot }) => {
+export const renameSession = (id: string, title: string): Promise<void> => {
+  let renamed: Session | undefined
+  return withActive('readwrite', async (tx, { slot }) => {
     const sessions = tx.objectStore(slots[slot].sessions)
     const session = await sessions.get(id)
     if (session) {
@@ -254,12 +270,19 @@ export const renameSession = (id: string, title: string): Promise<void> =>
         sessions.put(session),
         tx.objectStore(slots[slot].summaries).put(storedSummary(session)),
       ])
+      renamed = session
+    }
+  }).then(() => {
+    if (renamed) {
+      shadow.mirrorSession(renamed)
     }
   })
+}
 
 /** 删除会话，仅清理已无会话引用的本地原件；远端文件不删。 */
-export const deleteSession = (sessionId: string): Promise<void> =>
-  withActive('readwrite', async (tx, { slot }) => {
+export const deleteSession = (sessionId: string): Promise<void> => {
+  const orphaned = new Set<string>()
+  return withActive('readwrite', async (tx, { slot }) => {
     const stores = slots[slot]
     const summaries = tx.objectStore(stores.summaries)
     const summary = await summaries.get(sessionId)
@@ -270,14 +293,20 @@ export const deleteSession = (sessionId: string): Promise<void> =>
     for (const id of summary?.fileIds ?? []) {
       if ((await summaries.index('fileIds').count(id)) === 0) {
         await tx.objectStore(stores.files).delete(id)
+        orphaned.add(id)
       }
     }
+  }).then(() => {
+    shadow.mirrorDeleteSession(sessionId, [...orphaned])
   })
+}
 
 export const saveFiles = (files: StoredFile[]): Promise<void> =>
   withActive('readwrite', async (tx, { slot }) => {
     const store = tx.objectStore(slots[slot].files)
     await Promise.all(files.map((file) => store.put(file)))
+  }).then(() => {
+    shadow.mirrorFiles(files)
   })
 
 export const loadFile = (id: string): Promise<Blob | undefined> =>
@@ -285,6 +314,47 @@ export const loadFile = (id: string): Promise<Blob | undefined> =>
     'readonly',
     async (tx, { slot }) => (await tx.objectStore(slots[slot].files).get(id))?.blob
   )
+
+/** 流式扫描附件原件，供影子镜像全量重建，避免一次性把全部原件驻留内存。 */
+export const scanFiles = async (onFile: (file: StoredFile) => boolean): Promise<void> => {
+  await withActive('readonly', async (tx, { slot }) => {
+    let cursor = await tx.objectStore(slots[slot].files).openCursor()
+    while (cursor) {
+      if (!onFile(cursor.value)) {
+        break
+      }
+      cursor = await cursor.continue()
+    }
+  })
+}
+
+/**
+ * 导入/覆盖/清空历史提交成功后全量重建原生影子镜像：先清空再逐条写回。
+ * 后台串行执行，失败只记日志；冷启动恢复只在主库为空时触发，不受重建中途状态影响。
+ */
+const rebuildShadow = () => {
+  if (!shadow.shadowAvailable()) {
+    return
+  }
+  void shadow.mirrorClearAll().then(async (cleared) => {
+    if (!cleared) {
+      reportStorageError('clear shadow mirror')(new Error('shadowClearAll returned false'))
+      return
+    }
+    try {
+      await scanSessions((session) => {
+        shadow.mirrorSession(session)
+        return true
+      })
+      await scanFiles((file) => {
+        shadow.mirrorFiles([file])
+        return true
+      })
+    } catch (error) {
+      reportStorageError('rebuild shadow mirror')(error)
+    }
+  })
+}
 
 const inactiveSlot = (slot: HistoryState['slot']) => (slot === 'primary' ? 'alternate' : 'primary')
 
@@ -470,6 +540,7 @@ export const beginStaging = async () => {
       if (clearInBackground) {
         scheduleRetiredCleanup()
       }
+      rebuildShadow()
     },
     async commitMerge({
       localOverrides,
@@ -682,6 +753,7 @@ export const beginStaging = async () => {
       if (backgroundCleanup) {
         scheduleRetiredCleanup()
       }
+      rebuildShadow()
 
       return {
         summaries: [...activeSummaryMap.values()].map(toSessionSummary),

@@ -68,6 +68,7 @@ public final class MainActivity extends Activity {
     private Uri capture;
     private RecentPhotos recentPhotos;
     private FileExport historyExport;
+    private ShadowStore shadow;
     private ImageSave imageSave;
     private NativeRecorder recorder;
     private AppUpdater updater;
@@ -89,6 +90,7 @@ public final class MainActivity extends Activity {
         profilePreferences = getSharedPreferences("account_profile", MODE_PRIVATE);
         recentPhotos = new RecentPhotos(getContentResolver());
         historyExport = new FileExport(getContentResolver());
+        shadow = new ShadowStore(this);
         imageSave = new ImageSave(this);
         recorder = new NativeRecorder();
         frame = new FrameLayout(this);
@@ -487,6 +489,7 @@ public final class MainActivity extends Activity {
         if (fileCallback != null) fileCallback.onReceiveValue(null);
         recorder.finish(false);
         historyExport.close();
+        shadow.close();
         imageSave.finish(false);
         frame.removeView(webView);
         webView.destroy();
@@ -637,6 +640,30 @@ public final class MainActivity extends Activity {
 
         @JavascriptInterface
         public boolean finishHistoryExport() { return historyExport.close(); }
+
+        // 聊天数据的原生文件影子镜像：WebView IndexedDB 被系统清空时用于恢复。
+        @JavascriptInterface
+        public boolean shadowBegin(String path) { return shadow.begin(path); }
+
+        @JavascriptInterface
+        public boolean shadowAppend(String base64) { return shadow.append(base64); }
+
+        @JavascriptInterface
+        public boolean shadowFinish(boolean keep) { return shadow.finish(keep); }
+
+        @JavascriptInterface
+        public String shadowList(String dir) { return shadow.list(dir); }
+
+        @JavascriptInterface
+        public String shadowReadChunk(String path, long offset, int maxBytes) {
+            return shadow.readChunk(path, offset, maxBytes);
+        }
+
+        @JavascriptInterface
+        public boolean shadowDelete(String path) { return shadow.delete(path); }
+
+        @JavascriptInterface
+        public boolean shadowClearAll() { return shadow.clearAll(); }
 
         @JavascriptInterface
         public void requestImageSavePermission() {

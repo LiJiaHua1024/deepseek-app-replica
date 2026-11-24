@@ -24,19 +24,22 @@ const enqueueBackup = <T>(run: () => Promise<T>): Promise<T> => {
 
 const backupFileName = (date: Date) => `deepseek_data-${formatDate(date)}.zip`
 
-/** 导出为历史会话导出格式的 ZIP，可再次导入。 */
-export const exportHistory = (): Promise<{ name: string; blob: Blob }> =>
+/** 导出为历史会话导出格式的 ZIP，可再次导入。个别会话在主库中缺失时跳过，由 skipped 带回数量。 */
+export const exportHistory = (): Promise<{ name: string; blob: Blob; skipped: number }> =>
   enqueueBackup(async () => {
     // 列表、置顶和已加载内容保留导出开始时的快照；未打开的会话逐条读取，不填满详情缓存。
     const { sessions, sessionCache } = useChatStore.getState()
     const pinnedIds = new Set(useSettings.getState().pinnedSessions)
+    let skipped = 0
     async function* readSessions(): AsyncGenerator<Session> {
       for (const summary of sessions) {
         const session = Object.hasOwn(sessionCache, summary.id)
           ? sessionCache[summary.id]
           : await db.loadSession(summary.id)
         if (!session) {
-          throw new Error(`History session disappeared during export: ${summary.id}`)
+          // 主库里该条记录已丢失（如 IndexedDB 被系统清空）时跳过，尽量救出其余会话，不再中止整个导出。
+          skipped += 1
+          continue
         }
         // 详情读取期间可能重命名，归档标题与开始时的列表保持一致。
         yield { ...session, ...summary }
@@ -45,7 +48,7 @@ export const exportHistory = (): Promise<{ name: string; blob: Blob }> =>
     const { exportArchive } = await import('./history/exportArchive.js')
     const now = new Date()
     const blob = await exportArchive(readSessions(), pinnedIds)
-    return { name: backupFileName(now), blob }
+    return { name: backupFileName(now), blob, skipped }
   })
 
 /** 确认导入后调用：支持合并（默认）或覆盖。先校验 ZIP 并写入暂存，通过后再提交。 */
