@@ -259,18 +259,12 @@ export const App = () => {
   // 文件数、存储空间达到上限时，附件上只显示「上传失败」，原因用 toast 说明
   useEffect(() => onUploadNotice(showToast), [])
 
-  // IndexedDB 被系统清空后，从原生影子镜像恢复的结果告警（恢复条数或无备份）
   const storageAlert = useChatStore((state) => state.storageAlert)
   useEffect(() => {
     if (storageAlert === null) {
       return
     }
-    showToast(
-      typeof storageAlert === 'number'
-        ? { key: 'storageResetRecovered', params: { count: storageAlert } }
-        : { key: 'storageResetEmpty' },
-      6000
-    )
+    showToast(storageAlert, 6000)
     useChatStore.setState({ storageAlert: null })
   }, [storageAlert])
   useEffect(bindChatPersistence, [])

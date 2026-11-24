@@ -1,5 +1,6 @@
 import { create } from 'zustand'
 import { createId } from '../../utils/id.js'
+import type { TranslationMessage } from '../../i18n/index.js'
 import { DEFAULT_CHAT_MODEL } from '../api/chatConfig.js'
 import { ApiError, streamChatMessage } from '../api/client.js'
 import type { CreateMessageRequest, MessageParam } from '../api/types.js'
@@ -45,7 +46,7 @@ import {
 } from './contextSummary.js'
 import { prepareCustomAttachments } from './customAttachments.js'
 import * as db from './db.js'
-import * as shadow from './shadow.js'
+import type { MigrationNotice } from './androidStorage.js'
 import {
   cancelMessageEdit,
   clearAllDrafts,
@@ -134,8 +135,7 @@ type ChatState = {
   pendingJump: PendingMessageJump | null
   /** 正在生成回复的会话 */
   streaming: Record<string, AbortController>
-  /** IndexedDB 被清空后从原生影子镜像恢复的结果：恢复条数，或 'empty' 表示无可恢复备份 */
-  storageAlert: number | 'empty' | null
+  storageAlert: TranslationMessage | null
 }
 
 export const useChatStore = create<ChatState>(() => ({
@@ -357,85 +357,18 @@ const settleInterrupted = (session: Session): Session => {
   }
 }
 
-/**
- * 主库为空（冷启动时 IndexedDB 被整库清空）时，从原生影子镜像全量恢复回 IndexedDB。
- * 返回恢复的会话条数；非 Android 环境或镜像不存在时返回 0。
- */
-const restoreFromShadow = async (): Promise<number> => {
-  if (!shadow.shadowAvailable()) {
-    return 0
-  }
-  shadow.setShadowRestoring(true)
-  try {
-    const ids = await shadow.listShadowSessions()
-    let restored = 0
-    for (const id of ids) {
-      try {
-        const session = await shadow.readShadowSession(id)
-        if (!session) {
-          continue
-        }
-        const fileIds = new Set<string>()
-        for (const message of session.messages) {
-          if (message.role === 'user') {
-            for (const file of message.files) {
-              fileIds.add(file.id)
-            }
-          }
-        }
-        const files: db.StoredFile[] = []
-        for (const fileId of fileIds) {
-          const blob = await shadow.readShadowFile(fileId)
-          if (blob) {
-            files.push({ id: fileId, blob })
-          }
-        }
-        await db.saveSession(session, files)
-        restored += 1
-      } catch (error) {
-        db.reportStorageError('restore session from shadow mirror')(error)
-      }
-    }
-    return restored
-  } finally {
-    shadow.setShadowRestoring(false)
-  }
-}
-
-/** 运行期检测到 IndexedDB 被清空重建：从影子镜像恢复，并与内存中尚未落库的会话合并。 */
-let storageResetRecovery: Promise<void> | undefined
-const recoverFromStorageReset = (): Promise<void> => {
-  storageResetRecovery ??= (async () => {
-    try {
-      const restored = await restoreFromShadow()
-      if (restored > 0) {
-        set({ storageAlert: restored })
-        const summaries = await db.loadSessionSummaries()
-        // 内存里可能还有尚未保存的新会话，合并进列表避免被恢复结果覆盖掉。
-        const merged = new Map(summaries.map((summary) => [summary.id, summary]))
-        for (const summary of get().sessions) {
-          if (!merged.has(summary.id)) {
-            merged.set(summary.id, summary)
-          }
-        }
-        set({ sessions: sortSessions([...merged.values()]) })
-        retrySaveSessions()
-      } else {
-        set({ storageAlert: 'empty' })
-      }
-    } catch (error) {
-      db.reportStorageError('recover from storage reset')(error)
-      set({ storageAlert: 'empty' })
-    } finally {
-      storageResetRecovery = undefined
-    }
-  })()
-  return storageResetRecovery
-}
-
 if (typeof window !== 'undefined') {
   window.addEventListener('chat-storage-reset', () => {
-    void recoverFromStorageReset()
+    set({ storageAlert: { key: 'storageResetDuringUse' } })
+  })
+  window.addEventListener('chat-storage-migrated', (event) => {
+    const { recovered, missing, unverified } = (event as CustomEvent<MigrationNotice>).detail
+    set({
+      storageAlert:
+        missing || unverified
+          ? { key: 'storageMigrationIncomplete', params: { missing, unverified } }
+          : { key: 'storageMigrationRecovered', params: { count: recovered } },
+    })
   })
 }
 
@@ -450,15 +383,7 @@ export const initChat = (): Promise<void> => {
   set({ initError: false })
   initTask = (async () => {
     try {
-      let summaries = await db.loadSessionSummaries()
-      if (summaries.length === 0 && epoch === historyEpoch) {
-        // 冷启动发现主库为空：可能是 IndexedDB 被系统清空，尝试从原生影子镜像恢复。
-        const restored = await restoreFromShadow()
-        if (restored > 0 && epoch === historyEpoch) {
-          set({ storageAlert: restored })
-          summaries = await db.loadSessionSummaries()
-        }
-      }
+      const summaries = await db.loadSessionSummaries()
       if (epoch === historyEpoch) {
         set({ ready: true, sessions: sortSessions(summaries) })
       }

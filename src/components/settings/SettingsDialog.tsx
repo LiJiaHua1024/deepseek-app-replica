@@ -15,6 +15,7 @@ import {
   BackupError,
   clearHistory,
   exportHistory,
+  formatExportWarning,
   formatImportResult,
   importHistory,
   type ImportMode,
@@ -603,9 +604,11 @@ const ExportHistory = ({ disabled }: { disabled: boolean }) => {
     setBusy(true)
     setStatus(null)
     try {
-      const { name, blob, skipped } = await exportHistory()
-      if (skipped > 0) {
-        showToast({ key: 'historyExportSkipped', params: { count: skipped } })
+      const exported = await exportHistory()
+      const { name, blob } = exported
+      const warning = formatExportWarning(exported)
+      if (warning) {
+        showToast(warning)
       }
       if (android) {
         await saveAndroidHistory(name, blob)

@@ -63,10 +63,11 @@ export const en = {
   sessionLoadFailed: 'Unable to load this chat. Please try again.',
   sessionSaveFailed:
     'Chats or attachments have not been saved locally. Retry before closing this page.',
-  storageResetRecovered:
-    'Local storage was cleared by the system. {count} chat(s) were restored from the on-device backup. Please export a new backup.',
-  storageResetEmpty:
-    'Local storage was cleared by the system and no on-device backup is available. Please export a backup regularly.',
+  storageResetDuringUse:
+    'Browser storage was cleared and saving is paused. Export any chats you can still read before reopening the page.',
+  storageMigrationRecovered: 'Restored {count} chat(s) from the previous on-device backup.',
+  storageMigrationIncomplete:
+    'The previous storage was kept. {missing} chat(s) could not be recovered and {unverified} backup record(s) could not be verified.',
   sessionDeleteFailed: 'Unable to delete this chat. Please try again.',
   settings: 'Settings',
   checkForUpdate: 'Check for updates',
@@ -266,7 +267,10 @@ export const en = {
     'Includes all chat history and locally stored images. Other attachments retain file details only. Your API Key is not included.',
   historyExporting: 'Exporting and saving…',
   historyExportSaved: 'Saved: {name}',
-  historyExportSkipped: 'Export finished, but {count} chat(s) were skipped because their local data was missing',
+  historyExportSkipped: 'Skipped {count} unreadable chat(s) during export.',
+  historyExportUnreadableImages: 'Skipped {images} unreadable original image(s) during export.',
+  historyExportSkippedWithImages:
+    'Skipped {count} unreadable chat(s) and {images} unreadable original image(s) during export.',
   exportAllDownload: 'Download',
   deleteAllSessions: 'Delete all chats',
   deleteAllSessionsModalTitle: 'Once deleted, all chats will be cleared and cannot be recovered.',
