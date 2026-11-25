@@ -245,7 +245,7 @@ public final class MainActivity extends Activity {
             if ("GET".equals(request.getMethod()) && path != null && path.startsWith("/chat-attachment/")) {
                 try {
                     return new WebResourceResponse("application/octet-stream", null, 200, "OK",
-                        Map.of("Cache-Control", "no-store", "X-Content-Type-Options", "nosniff"),
+                        Maps.of("Cache-Control", "no-store", "X-Content-Type-Options", "nosniff"),
                         chatStorage.openAttachment(path.substring("/chat-attachment/".length())));
                 } catch (IOException ignored) {
                     // A missing native file returns the bundled origin's 404.
@@ -265,7 +265,7 @@ public final class MainActivity extends Activity {
                 String name = path.substring(1);
                 String extension = name.substring(name.lastIndexOf('.') + 1);
                 String type = assetMimeType(extension);
-                Map<String, String> headers = Map.of("Content-Security-Policy",
+                Map<String, String> headers = Maps.of("Content-Security-Policy",
                     "default-src 'none'; script-src 'self'; worker-src 'self'; child-src 'self'; "
                     + "style-src 'self' 'unsafe-inline'; "
                     + "img-src 'self' https: data: blob:; font-src 'self' data:; "
@@ -279,7 +279,7 @@ public final class MainActivity extends Activity {
                 }
             }
             return new WebResourceResponse("text/plain", "UTF-8", 404, "Not Found",
-                Map.of(), new ByteArrayInputStream(new byte[0]));
+                Maps.of(), new ByteArrayInputStream(new byte[0]));
         }
     }
 
