@@ -426,10 +426,14 @@ final class ChatStorage extends SQLiteOpenHelper {
     private static void writeSessionRow(SQLiteDatabase db, int slot, JSONObject row, String rawData,
             boolean add) throws Exception {
         String id = row.getString("id");
+        double created = row.optDouble("createdAt", 0);
+        if (!Double.isFinite(created)) created = 0;
+        double updated = row.optDouble("updatedAt", 0);
+        if (!Double.isFinite(updated)) updated = 0;
         ContentValues values = new ContentValues();
-        values.put("title", row.getString("title"));
-        values.put("created", row.getDouble("createdAt"));
-        values.put("updated", row.getDouble("updatedAt"));
+        values.put("title", row.optString("title", ""));
+        values.put("created", created);
+        values.put("updated", updated);
         values.put("data", rawData.getBytes(StandardCharsets.UTF_8));
         if (add || db.update("sessions", values, "slot=? AND id=?", keys(slot, id)) == 0) {
             values.put("slot", slot);
@@ -438,9 +442,11 @@ final class ChatStorage extends SQLiteOpenHelper {
         } else {
             db.delete("refs", "slot=? AND session=?", keys(slot, id));
         }
-        JSONArray refs = row.getJSONArray("fileIds");
-        for (int i = 0; i < refs.length(); i++) {
-            db.execSQL("INSERT INTO refs VALUES (?,?,?)", new Object[]{slot, id, refs.getString(i)});
+        JSONArray refs = row.optJSONArray("fileIds");
+        if (refs != null) {
+            for (int i = 0; i < refs.length(); i++) {
+                db.execSQL("INSERT INTO refs VALUES (?,?,?)", new Object[]{slot, id, refs.getString(i)});
+            }
         }
     }
 

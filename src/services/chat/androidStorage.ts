@@ -9,7 +9,14 @@ import {
   type StagingWriter,
   type StoredFile,
 } from './storageTypes.js'
-import { toSessionSummary, type Session, type SessionSummary } from './types.js'
+import {
+  toSessionSummary,
+  type AssistantMessage,
+  type FileAttachment,
+  type Session,
+  type SessionSummary,
+  type UserMessage,
+} from './types.js'
 
 const device = (globalThis as { DeepSeekAndroid?: AndroidBridge }).DeepSeekAndroid
 export const available = Boolean(device?.chatStorage || device?.chatStorageAsync)
@@ -218,20 +225,59 @@ const readMirror = (path: string): Uint8Array<ArrayBuffer>[] => {
   }
 }
 
+const sanitizeLegacySession = (id: string, value: unknown): Session | undefined => {
+  if (!value || typeof value !== 'object') {
+    return undefined
+  }
+  const raw = value as Record<string, unknown>
+  if (!Array.isArray(raw.messages)) {
+    return undefined
+  }
+  const rawCreated =
+    typeof raw.createdAt === 'number' && Number.isFinite(raw.createdAt) ? raw.createdAt : undefined
+  const rawUpdated =
+    typeof raw.updatedAt === 'number' && Number.isFinite(raw.updatedAt) ? raw.updatedAt : undefined
+  const createdAt = rawCreated ?? rawUpdated ?? 0
+  const updatedAt = rawUpdated ?? rawCreated ?? 0
+  const messages = raw.messages.flatMap((item): Session['messages'] => {
+    if (!item || typeof item !== 'object') {
+      return []
+    }
+    const msg = item as Record<string, unknown>
+    if (msg.role === 'user') {
+      const files = Array.isArray(msg.files)
+        ? msg.files.filter(
+            (file): file is FileAttachment =>
+              Boolean(file) &&
+              typeof file === 'object' &&
+              typeof (file as { id?: unknown }).id === 'string'
+          )
+        : []
+      return [{ ...(msg as UserMessage), files }]
+    }
+    if (msg.role === 'assistant') {
+      return [msg as AssistantMessage]
+    }
+    return []
+  })
+  return {
+    ...(raw as Session),
+    id: typeof raw.id === 'string' && raw.id ? raw.id : id,
+    title: typeof raw.title === 'string' ? raw.title : '',
+    createdAt,
+    updatedAt,
+    messages,
+  }
+}
+
 const readMirrorSession = (id: string): Session | undefined => {
   const bytes = readMirror(`sessions/${id}.json`)
   try {
     const decoder = new TextDecoder('utf-8', { fatal: true })
     const text = bytes.map((part) => decoder.decode(part, { stream: true })).join('')
-    const session = JSON.parse(text + decoder.decode()) as Session | null
-    if (
-      session?.id === id &&
-      typeof session.title === 'string' &&
-      Number.isFinite(session.createdAt) &&
-      Number.isFinite(session.updatedAt) &&
-      Array.isArray(session.messages)
-    ) {
-      return session
+    const parsed = JSON.parse(text + decoder.decode()) as { id?: unknown } | null
+    if (parsed?.id === id) {
+      return sanitizeLegacySession(id, parsed)
     }
   } catch {
     // Keep the unreadable source for recovery.
@@ -250,6 +296,7 @@ const migrate = async () => {
     const indexedFiles = new Set(await legacy?.fileIds())
     const indexedIds = new Set([...sessionIds, ...((await legacy?.summaryIds()) ?? [])])
     const mirrorSessions = new Set(mirrorIds('sessions'))
+    const mirrorFiles = new Set(mirrorIds('files'))
     const useMirrorList = indexedIds.size === 0
     const ids = useMirrorList ? mirrorSessions : indexedIds
     // An intact legacy index is authoritative for presence. A mirror-only record might
@@ -260,13 +307,11 @@ const migrate = async () => {
 
     token = await request<string>('begin', { migration: true })
     const referenced = new Map<string, string>()
-    for (const id of ids) {
-      const indexed = sessionIds.has(id) ? await legacy?.session(id) : undefined
-      const session = indexed ?? (mirrorSessions.has(id) ? readMirrorSession(id) : undefined)
-      if (!session) {
-        notice.missing += 1
-        continue
-      }
+    let failedFiles = 0
+    let batch: { session: Session; recovered: boolean }[] = []
+    let batchBytes = 0
+
+    const recordReferences = (session: Session) => {
       for (const message of session.messages) {
         if (message.role === 'user') {
           for (const file of message.files ?? []) {
@@ -276,31 +321,112 @@ const migrate = async () => {
           }
         }
       }
-      await write({ token, sessions: [session], add: true })
-      if (!indexed) {
-        notice.recovered += 1
+    }
+
+    const flushSessions = async () => {
+      if (!batch.length) {
+        return
+      }
+      const current = batch
+      batch = []
+      batchBytes = 0
+      try {
+        await write({
+          token,
+          sessions: current.map((item) => item.session),
+          add: true,
+        })
+        for (const item of current) {
+          recordReferences(item.session)
+          if (item.recovered) {
+            notice.recovered += 1
+          }
+        }
+      } catch {
+        for (const item of current) {
+          try {
+            await write({ token, sessions: [item.session], add: true })
+            recordReferences(item.session)
+            if (item.recovered) {
+              notice.recovered += 1
+            }
+          } catch (error) {
+            reportStorageError('migrate legacy session')(error)
+            notice.missing += 1
+          }
+        }
       }
       await pause()
     }
 
-    for (const id of indexedFiles) {
-      const original = await legacy?.file(id)
-      if (!original) {
-        throw new Error('A legacy attachment disappeared during migration')
+    for (const id of ids) {
+      let indexed: Session | undefined
+      if (sessionIds.has(id)) {
+        try {
+          indexed = sanitizeLegacySession(id, await legacy?.session(id))
+        } catch (error) {
+          reportStorageError('read legacy session')(error)
+        }
       }
-      await write({ token, files: [original] })
+      let recovered = false
+      let session = indexed
+      if (!session && mirrorSessions.has(id)) {
+        session = readMirrorSession(id)
+        recovered = Boolean(session)
+      }
+      if (!session) {
+        notice.missing += 1
+        continue
+      }
+      batch.push({ session, recovered })
+      batchBytes += JSON.stringify(session).length
+      if (batch.length >= 32 || batchBytes >= 2 * 1024 * 1024) {
+        await flushSessions()
+      }
+    }
+    await flushSessions()
+
+    for (const id of indexedFiles) {
+      try {
+        let file: StoredFile | undefined
+        try {
+          const original = await legacy?.file(id)
+          if (original?.blob && typeof original.blob.size === 'number') {
+            file = original
+          }
+        } catch (error) {
+          reportStorageError('read legacy attachment')(error)
+        }
+        if (!file && mirrorFiles.has(id)) {
+          const blob = new Blob(readMirror(`files/${id}.bin`), { type: referenced.get(id) ?? '' })
+          file = { id, blob }
+        }
+        if (!file) {
+          failedFiles += 1
+          continue
+        }
+        await write({ token, files: [file] })
+      } catch (error) {
+        reportStorageError('migrate legacy attachment')(error)
+        failedFiles += 1
+      }
       await pause()
     }
-    for (const id of mirrorIds('files')) {
+    for (const id of mirrorFiles) {
       if (!indexedFiles.has(id) && (useMirrorList || referenced.has(id))) {
-        const blob = new Blob(readMirror(`files/${id}.bin`), { type: referenced.get(id) })
-        await write({ token, files: [{ id, blob }] })
+        try {
+          const blob = new Blob(readMirror(`files/${id}.bin`), { type: referenced.get(id) ?? '' })
+          await write({ token, files: [{ id, blob }] })
+        } catch (error) {
+          reportStorageError('migrate mirror attachment')(error)
+          failedFiles += 1
+        }
         await pause()
       }
     }
 
     // This SQLite transaction publishes both stores and the one-time migration marker.
-    const retainLegacy = notice.missing > 0 || notice.unverified > 0
+    const retainLegacy = notice.missing > 0 || notice.unverified > 0 || failedFiles > 0
     await request('replace', { token, retainLegacy })
   } catch (error) {
     if (token) {
@@ -322,6 +448,7 @@ const migrate = async () => {
 const retireLegacy = async () => {
   try {
     if (await request<boolean>('canRetire')) {
+      await pause()
       await deleteLegacyHistory()
       if (!device?.shadowClearAll?.()) {
         throw new Error('Unable to remove the legacy Android mirror')

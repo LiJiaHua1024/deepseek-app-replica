@@ -741,7 +741,24 @@ export const openLegacyHistory = async () => {
 export const deleteLegacyHistory = () =>
   new Promise<void>((resolve, reject) => {
     const request = indexedDB.deleteDatabase('chat-demo')
-    request.onsuccess = () => resolve()
-    request.onerror = () => reject(request.error)
-    request.onblocked = () => reject(new Error('Legacy history cleanup is blocked'))
+    let blockedTimer: ReturnType<typeof setTimeout> | undefined
+    const cleanup = () => {
+      if (blockedTimer !== undefined) {
+        clearTimeout(blockedTimer)
+        blockedTimer = undefined
+      }
+    }
+    request.onsuccess = () => {
+      cleanup()
+      resolve()
+    }
+    request.onerror = () => {
+      cleanup()
+      reject(request.error)
+    }
+    request.onblocked = () => {
+      blockedTimer ??= setTimeout(() => {
+        reject(new Error('Legacy history cleanup is blocked'))
+      }, 3000)
+    }
   })

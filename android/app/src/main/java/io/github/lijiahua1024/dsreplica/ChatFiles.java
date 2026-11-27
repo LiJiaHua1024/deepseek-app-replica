@@ -1,8 +1,10 @@
 package io.github.lijiahua1024.dsreplica;
 
+import android.system.ErrnoException;
 import android.system.Os;
 import android.system.OsConstants;
 import android.util.Base64;
+import android.util.Log;
 import java.io.File;
 import java.io.FileDescriptor;
 import java.io.FileInputStream;
@@ -21,13 +23,14 @@ final class ChatFiles {
 
     private final File directory;
     private final Map<String, Upload> uploads = new HashMap<>();
+    private boolean directorySynced;
 
     ChatFiles(File filesDir) {
         directory = new File(filesDir, "chat-attachments");
     }
 
     synchronized String begin(Object owner) throws IOException {
-        if (!directory.isDirectory() && !directory.mkdir()) {
+        if (!directory.isDirectory() && !directory.mkdirs()) {
             throw new IOException("Unable to create the attachment directory");
         }
         String token = UUID.randomUUID().toString();
@@ -55,14 +58,32 @@ final class ChatFiles {
     }
 
     synchronized void syncDirectory() throws Exception {
-        for (File path : new File[]{directory, directory.getParentFile()}) {
-            FileDescriptor fd = Os.open(path.getPath(), OsConstants.O_RDONLY, 0);
+        File[] targets = directorySynced
+            ? new File[]{directory}
+            : new File[]{directory, directory.getParentFile()};
+        for (File path : targets) {
+            if (path == null) continue;
             try {
-                Os.fsync(fd);
-            } finally {
-                Os.close(fd);
+                FileDescriptor fd = Os.open(path.getPath(), OsConstants.O_RDONLY, 0);
+                try {
+                    Os.fsync(fd);
+                } finally {
+                    Os.close(fd);
+                }
+            } catch (ErrnoException error) {
+                int errno = error.errno;
+                if (errno == OsConstants.EINVAL || errno == OsConstants.EBADF
+                        || errno == OsConstants.EPERM || errno == OsConstants.EACCES
+                        || errno == OsConstants.EROFS) {
+                    if (!directorySynced) {
+                        Log.w("ChatFiles", "Directory fsync skipped (" + errno + ")");
+                    }
+                } else {
+                    throw error;
+                }
             }
         }
+        directorySynced = true;
     }
 
     synchronized void committed(String token) {
