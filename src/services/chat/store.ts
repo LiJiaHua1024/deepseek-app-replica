@@ -323,7 +323,8 @@ export const bindChatPersistence = () => {
 
 /** 按当前开关创建回复：深度思考对应 thinking，智能搜索控制 deepseek_web_search。 */
 const createReply = (): AssistantMessage => {
-  const { thinking, search, chatConfig } = useSettings.getState()
+  const settings = useSettings.getState()
+  const { thinking, search, chatConfig } = settings
   const customEndpoint = Boolean(chatConfig.endpoint)
   return {
     id: createId(),
@@ -333,6 +334,7 @@ const createReply = (): AssistantMessage => {
     thinking: !customEndpoint && thinking,
     search: !customEndpoint && search,
     prefix: !customEndpoint && chatConfig.format === 'messages',
+    ...(!customEndpoint ? { latestReminder: createLatestReminder(settings) } : {}),
     status: 'pending',
     blocks: [],
   }
@@ -1327,6 +1329,34 @@ const waitForRetry = (attempt: number, signal: AbortSignal) =>
     signal.addEventListener('abort', onAbort, { once: true })
   })
 
+/** 让出一帧完成首屏消息渲染，再进行历史估算与请求准备。 */
+const yieldToPaint = (signal: AbortSignal) => {
+  if (
+    signal.aborted ||
+    typeof requestAnimationFrame !== 'function' ||
+    typeof document === 'undefined' ||
+    document.visibilityState !== 'visible'
+  ) {
+    return Promise.resolve()
+  }
+  return new Promise<void>((resolve) => {
+    let settled = false
+    const finish = () => {
+      if (settled) {
+        return
+      }
+      settled = true
+      clearTimeout(fallbackTimer)
+      cancelAnimationFrame(rafId)
+      signal.removeEventListener('abort', finish)
+      resolve()
+    }
+    const rafId = requestAnimationFrame(finish)
+    const fallbackTimer = setTimeout(finish, 32)
+    signal.addEventListener('abort', finish, { once: true })
+  })
+}
+
 /**
  * 请求并消费流：先补齐附件的 serverId，再发请求；流式增量按动画帧刷新内存，完成、失败或停止后落盘。
  * 补传失败时回复记为 upload 错误，可重试。
@@ -1362,37 +1392,42 @@ const streamReply = async (sessionId: string, initial: AssistantMessage, request
   streamFlushes.set(sessionId, flush)
 
   const signal = controller.signal
-  const summarize = createContextSummarizer(apiKey, signal, chatConfig)
-  const requestModel = reply.model ?? DEFAULT_CHAT_MODEL
-  const initialOutputTokens = custom ? CUSTOM_OUTPUT_TOKENS : MAX_OUTPUT_TOKENS
-  const minOutputReserve = custom ? CUSTOM_OUTPUT_TOKENS : MIN_OUTPUT_RESERVE
-  const fallbackOutputTokens = custom ? 1_024 : initial.thinking ? 32_768 : 8_192
-  const window = custom ? CUSTOM_CONTEXT_WINDOW : undefined
-  const windowLimit = window ?? WINDOW_TOKENS
-  const tokenScale = estimateBranchScale(
-    request.history,
-    requestModel,
-    getSession(sessionId)?.contextCheckpoints
-  )
-  const scaleEstimate = (tokens: number) =>
-    tokenScale === 1 ? tokens : Math.ceil(tokens * tokenScale)
-  const budget = contextBudget(minOutputReserve, window)
-  let historyBudget = Math.max(
-    0,
-    budget.input -
-      scaleEstimate(
-        estimateQuestionTokens(request.question) + estimatePrefixTokens(request.prefix)
-      ) -
-      PROMPT_OVERHEAD_TOKENS
-  )
-  let historyRetries = 0
-  let historySummaryRequests = 0
-  let context: HistoryContext | undefined
-  let maxOutputTokens = initialOutputTokens
-  let reduceInput = false
-  let reducedInput: Awaited<ReturnType<typeof summarizeCurrentInput>> = null
-  let invalidatedRetries = 0
   try {
+    await yieldToPaint(signal)
+    if (controller.signal.aborted) {
+      reply = settleReply(reply, 'stopped', Date.now())
+      return
+    }
+    const summarize = createContextSummarizer(apiKey, signal, chatConfig)
+    const requestModel = reply.model ?? DEFAULT_CHAT_MODEL
+    const initialOutputTokens = custom ? CUSTOM_OUTPUT_TOKENS : MAX_OUTPUT_TOKENS
+    const minOutputReserve = custom ? CUSTOM_OUTPUT_TOKENS : MIN_OUTPUT_RESERVE
+    const fallbackOutputTokens = custom ? 1_024 : initial.thinking ? 32_768 : 8_192
+    const window = custom ? CUSTOM_CONTEXT_WINDOW : undefined
+    const windowLimit = window ?? WINDOW_TOKENS
+    const tokenScale = estimateBranchScale(
+      request.history,
+      requestModel,
+      getSession(sessionId)?.contextCheckpoints
+    )
+    const scaleEstimate = (tokens: number) =>
+      tokenScale === 1 ? tokens : Math.ceil(tokens * tokenScale)
+    const budget = contextBudget(minOutputReserve, window)
+    let historyBudget = Math.max(
+      0,
+      budget.input -
+        scaleEstimate(
+          estimateQuestionTokens(request.question) + estimatePrefixTokens(request.prefix)
+        ) -
+        PROMPT_OVERHEAD_TOKENS
+    )
+    let historyRetries = 0
+    let historySummaryRequests = 0
+    let context: HistoryContext | undefined
+    let maxOutputTokens = initialOutputTokens
+    let reduceInput = false
+    let reducedInput: Awaited<ReturnType<typeof summarizeCurrentInput>> = null
+    let invalidatedRetries = 0
     for (;;) {
       /** 附件补齐前出错属于上传失败，请求还没有发出 */
       let preparing = false
@@ -1471,10 +1506,12 @@ const streamReply = async (sessionId: string, initial: AssistantMessage, request
           ? undefined
           : prepared.prefix
             ? prepared.prefix.latestReminder
-            : createLatestReminder(useSettings.getState())
-        reply = { ...reply, latestReminder }
-        updateReply(sessionId, reply)
-        persist(sessionId)
+            : (reply.latestReminder ?? createLatestReminder(useSettings.getState()))
+        if (reply.latestReminder !== latestReminder) {
+          reply = { ...reply, latestReminder }
+          updateReply(sessionId, reply)
+          persist(sessionId)
+        }
         const activeQuestion = reducedInput?.question ?? prepared.question
         const activePrefix = reducedInput ? reducedInput.prefix : prepared.prefix
         messages = toRequestMessages(

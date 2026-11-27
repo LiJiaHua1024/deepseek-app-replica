@@ -26,7 +26,7 @@ final class ChatFiles {
         directory = new File(filesDir, "chat-attachments");
     }
 
-    String begin(Object owner) throws IOException {
+    synchronized String begin(Object owner) throws IOException {
         if (!directory.isDirectory() && !directory.mkdir()) {
             throw new IOException("Unable to create the attachment directory");
         }
@@ -35,7 +35,7 @@ final class ChatFiles {
         return token;
     }
 
-    void append(Object owner, String token, String data) throws IOException {
+    synchronized void append(Object owner, String token, String data) throws IOException {
         Upload upload = uploads.get(token);
         if (upload == null || upload.owner() != owner || upload.stream() == null
                 || data.length() > 350_000) {
@@ -44,7 +44,7 @@ final class ChatFiles {
         upload.stream().write(Base64.decode(data, Base64.NO_WRAP));
     }
 
-    void prepare(Object owner, String token) throws IOException {
+    synchronized void prepare(Object owner, String token) throws IOException {
         Upload upload = uploads.get(token);
         if (upload == null || upload.owner() != owner || upload.stream() == null) {
             throw new IOException("Attachment upload is unavailable");
@@ -54,7 +54,7 @@ final class ChatFiles {
         uploads.put(token, new Upload(owner, null));
     }
 
-    void syncDirectory() throws Exception {
+    synchronized void syncDirectory() throws Exception {
         for (File path : new File[]{directory, directory.getParentFile()}) {
             FileDescriptor fd = Os.open(path.getPath(), OsConstants.O_RDONLY, 0);
             try {
@@ -65,11 +65,11 @@ final class ChatFiles {
         }
     }
 
-    void committed(String token) {
+    synchronized void committed(String token) {
         uploads.remove(token);
     }
 
-    void abandon(Object owner, String token) {
+    synchronized void abandon(Object owner, String token) {
         Upload upload = uploads.get(token);
         if (upload == null || upload.owner() != owner) return;
         uploads.remove(token);
@@ -83,25 +83,25 @@ final class ChatFiles {
         delete(token);
     }
 
-    void abandonAll(Object owner) {
+    synchronized void abandonAll(Object owner) {
         for (String token : uploads.keySet().toArray(new String[0])) {
             abandon(owner, token);
         }
     }
 
-    InputStream open(String token) throws IOException {
+    synchronized InputStream open(String token) throws IOException {
         if (!TOKEN.matcher(token).matches() || uploads.containsKey(token)) {
             throw new IOException("Invalid attachment path");
         }
         return new FileInputStream(file(token));
     }
 
-    String[] candidates() {
+    synchronized String[] candidates() {
         String[] names = directory.list((dir, name) -> TOKEN.matcher(name).matches());
         return names == null ? new String[0] : names;
     }
 
-    boolean delete(String token) {
+    synchronized boolean delete(String token) {
         if (uploads.containsKey(token)) return false;
         File file = file(token);
         return file.delete() || !file.exists();

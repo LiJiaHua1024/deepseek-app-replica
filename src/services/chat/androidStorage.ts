@@ -12,10 +12,63 @@ import {
 import { toSessionSummary, type Session, type SessionSummary } from './types.js'
 
 const device = (globalThis as { DeepSeekAndroid?: AndroidBridge }).DeepSeekAndroid
-export const available = Boolean(device?.chatStorage)
+export const available = Boolean(device?.chatStorage || device?.chatStorageAsync)
 
-const request = <Result>(method: string, payload: object = {}): Result => {
-  const reply = device?.chatStorage?.(method, JSON.stringify(payload))
+type PendingRequest = {
+  method: string
+  resolve: (value: unknown) => void
+  reject: (error: Error) => void
+}
+type ChatStorageReplyEvent = {
+  id: string
+  reply: { value?: unknown; error?: string }
+}
+
+let requestSeq = 0
+const pendingRequests = new Map<string, PendingRequest>()
+
+if (device?.chatStorageAsync && typeof globalThis.addEventListener === 'function') {
+  globalThis.addEventListener('android-chat-storage', (event: Event) => {
+    const detail = (event as CustomEvent<ChatStorageReplyEvent>).detail
+    if (!detail?.id) {
+      return
+    }
+    const pending = pendingRequests.get(detail.id)
+    if (!pending) {
+      return
+    }
+    pendingRequests.delete(detail.id)
+    if (detail.reply?.error) {
+      pending.reject(new Error(`${pending.method}: ${detail.reply.error}`))
+    } else {
+      pending.resolve(detail.reply?.value)
+    }
+  })
+}
+
+const dispatchAsync = <Result>(method: string, call: (id: string) => void): Promise<Result> =>
+  new Promise<Result>((resolve, reject) => {
+    const id = String(++requestSeq)
+    pendingRequests.set(id, {
+      method,
+      resolve: resolve as (value: unknown) => void,
+      reject,
+    })
+    try {
+      call(id)
+    } catch (error) {
+      pendingRequests.delete(id)
+      reject(error instanceof Error ? error : new Error(String(error)))
+    }
+  })
+
+const request = async <Result = unknown>(method: string, payload: object = {}): Promise<Result> => {
+  const json = JSON.stringify(payload)
+  const asyncCall = device?.chatStorageAsync
+  if (asyncCall) {
+    return dispatchAsync<Result>(method, (id) => asyncCall.call(device, id, method, json))
+  }
+  const reply = device?.chatStorage?.(method, json)
   if (!reply) {
     throw new Error('Android chat storage is unavailable')
   }
@@ -56,29 +109,45 @@ const write = async ({
   const uploads: UploadedFile[] = []
   try {
     for (const { id, blob } of files) {
-      const object = request<string>('upload', { token })
+      const object = await request<string>('upload', { token })
       uploads.push({ id, object, type: blob.type })
       for await (const chunk of readBlobChunks(blob)) {
         for (let offset = 0; offset < chunk.length; offset += CHUNK_SIZE) {
           const data = btoa(String.fromCharCode(...chunk.subarray(offset, offset + CHUNK_SIZE)))
-          request('append', { object, data })
+          await request('append', { object, data })
         }
       }
     }
-    request('write', {
-      token,
-      files: uploads,
-      sessions: sessions.map((session) => ({
-        ...storedSummary(session),
-        data: JSON.stringify(session),
-      })),
-      add,
-      overrideFiles,
-    })
+    const writeSessionAsync = device?.chatStorageWriteSessionAsync
+    if (sessions.length === 1 && writeSessionAsync) {
+      const session = sessions[0]
+      const metaJson = JSON.stringify({
+        token,
+        files: uploads,
+        summary: storedSummary(session),
+        add,
+        overrideFiles,
+      })
+      const sessionJson = JSON.stringify(session)
+      await dispatchAsync<null>('write', (id) =>
+        writeSessionAsync.call(device, id, metaJson, sessionJson)
+      )
+    } else {
+      await request('write', {
+        token,
+        files: uploads,
+        sessions: sessions.map((session) => ({
+          ...storedSummary(session),
+          data: JSON.stringify(session),
+        })),
+        add,
+        overrideFiles,
+      })
+    }
   } catch (error) {
     for (const { object } of uploads) {
       try {
-        request('abandon', { object })
+        await request('abandon', { object })
       } catch (cleanupError) {
         reportStorageError('abandon attachment upload')(cleanupError)
       }
@@ -87,15 +156,15 @@ const write = async ({
   }
 }
 
-const readSession = (id: string, token?: string): Session | undefined => {
-  const data = request<string | null>('read', { id, token })
+const readSession = async (id: string, token?: string): Promise<Session | undefined> => {
+  const data = await request<string | null>('read', { id, token })
   return data === null ? undefined : (JSON.parse(data) as Session)
 }
 
-const readFileTypes = (ids: Iterable<string>, token: string, includeStaged = false) => {
+const readFileTypes = async (ids: Iterable<string>, token: string, includeStaged = false) => {
   const keys = [...new Set(ids)]
   return keys.length
-    ? new Map(request<[string, string][]>('fileTypes', { ids: keys, token, includeStaged }))
+    ? new Map(await request<[string, string][]>('fileTypes', { ids: keys, token, includeStaged }))
     : new Map<string, string>()
 }
 
@@ -106,7 +175,7 @@ const pages = async function* <Row>(
 ) {
   let after: string | undefined
   for (;;) {
-    const rows = request<Row[]>(method, { token, after })
+    const rows = await request<Row[]>(method, { token, after })
     if (!rows.length) {
       return
     }
@@ -189,7 +258,7 @@ const migrate = async () => {
       notice.unverified = [...mirrorSessions].filter((id) => !indexedIds.has(id)).length
     }
 
-    token = request<string>('begin', { migration: true })
+    token = await request<string>('begin', { migration: true })
     const referenced = new Map<string, string>()
     for (const id of ids) {
       const indexed = sessionIds.has(id) ? await legacy?.session(id) : undefined
@@ -232,11 +301,11 @@ const migrate = async () => {
 
     // This SQLite transaction publishes both stores and the one-time migration marker.
     const retainLegacy = notice.missing > 0 || notice.unverified > 0
-    request('replace', { token, retainLegacy })
+    await request('replace', { token, retainLegacy })
   } catch (error) {
     if (token) {
       try {
-        request('discard', { token })
+        await request('discard', { token })
       } catch (discardError) {
         reportStorageError('discard unfinished migration')(discardError)
       }
@@ -252,12 +321,12 @@ const migrate = async () => {
 
 const retireLegacy = async () => {
   try {
-    if (request<boolean>('canRetire')) {
+    if (await request<boolean>('canRetire')) {
       await deleteLegacyHistory()
       if (!device?.shadowClearAll?.()) {
         throw new Error('Unable to remove the legacy Android mirror')
       }
-      request('retired')
+      await request('retired')
     }
   } catch (error) {
     reportStorageError('retire migrated history')(error)
@@ -269,7 +338,7 @@ const initialize = async () => {
   if (initialized) {
     return
   }
-  if (request<boolean>('needsMigration')) {
+  if (await request<boolean>('needsMigration')) {
     await migrate()
   }
   initialized = true
@@ -294,14 +363,14 @@ export const saveSession = (session: Session, files?: StoredFile[]) =>
   run(() => write({ sessions: [session], files }))
 export const renameSession = (id: string, title: string) =>
   run(async () => {
-    const session = readSession(id)
+    const session = await readSession(id)
     if (session) {
       await write({ sessions: [{ ...session, title }] })
     }
   })
 export const deleteSession = (id: string) =>
-  run(() => {
-    request('remove', { id })
+  run(async () => {
+    await request('remove', { id })
   })
 
 export const scanSessions = (
@@ -312,7 +381,7 @@ export const scanSessions = (
     for await (const ids of pages('ids', (id: string) => id)) {
       for (const id of ids) {
         if (!skip?.has(id)) {
-          const session = readSession(id)
+          const session = await readSession(id)
           if (session && !onSession(session)) {
             return
           }
@@ -323,7 +392,7 @@ export const scanSessions = (
 
 export const loadFile = async (id: string): Promise<Blob | undefined> => {
   const file = await run(async () => {
-    const metadata = request<{ object: string; type: string } | null>('file', { id })
+    const metadata = await request<{ object: string; type: string } | null>('file', { id })
     if (!metadata) {
       return undefined
     }
@@ -356,8 +425,8 @@ const applyFileTypes = (session: Session, types: ReadonlyMap<string, string>) =>
   return changed
 }
 
-const readStaged = (id: string, token: string) => {
-  const session = readSession(id, token)
+const readStaged = async (id: string, token: string) => {
+  const session = await readSession(id, token)
   if (!session) {
     throw new Error(`Staged session disappeared: ${id}`)
   }
@@ -379,7 +448,7 @@ export const stagingWriter = (token: string): StagingWriter => {
     updateFileTypes: (ids, types) =>
       run(async () => {
         for (const id of ids) {
-          const session = readStaged(id, token)
+          const session = await readStaged(id, token)
           if (applyFileTypes(session, types)) {
             await write({ token, sessions: [session] })
           }
@@ -394,16 +463,16 @@ export const beginStaging = async (): Promise<HistoryStaging> => {
     importId: token,
     commit: () =>
       run(async () => {
-        request('replace', { token })
+        await request('replace', { token })
         await retireLegacy()
       }),
     discard: () =>
-      run(() => {
-        request('discard', { token })
+      run(async () => {
+        await request('discard', { token })
       }),
     commitMerge: ({ localOverrides } = {}) =>
       run(async () => {
-        const revision = request<string>('revision', { token })
+        const revision = await request<string>('revision', { token })
         const summaries = new Map((await collectSummaries()).map((item) => [item.id, item]))
         const stagedIds: string[] = []
         for await (const ids of pages('ids', (id: string) => id, token)) {
@@ -419,14 +488,15 @@ export const beginStaging = async (): Promise<HistoryStaging> => {
         const updatedIds: string[] = []
         for (let i = 0; i < stagedIds.length; i += 64) {
           for (const id of stagedIds.slice(i, i + 64)) {
-            const incoming = readStaged(id, token)
+            const incoming = await readStaged(id, token)
             const override = localOverrides?.get(id)
-            const local = override?.session ?? (summaries.has(id) ? readSession(id) : undefined)
+            const local =
+              override?.session ?? (summaries.has(id) ? await readSession(id) : undefined)
             const fileIds = [
               ...storedSummary(incoming).fileIds,
               ...(local ? storedSummary(local).fileIds : []),
             ]
-            const fileTypes = readFileTypes(fileIds, token, true)
+            const fileTypes = await readFileTypes(fileIds, token, true)
             if (!local) {
               let changed = false
               for (const message of incoming.messages) {
@@ -453,7 +523,7 @@ export const beginStaging = async (): Promise<HistoryStaging> => {
               summaries.set(id, toSessionSummary(result.session))
               updatedIds.push(id)
             } else {
-              request('remove', { token, id })
+              await request('remove', { token, id })
             }
             if (result.changed) {
               merged += 1
@@ -463,7 +533,7 @@ export const beginStaging = async (): Promise<HistoryStaging> => {
           }
           await pause()
         }
-        request('merge', { token, revision })
+        await request('merge', { token, revision })
         return { summaries: [...summaries.values()], added, merged, unchanged, updatedIds }
       }),
   }

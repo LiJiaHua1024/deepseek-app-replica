@@ -17,6 +17,7 @@ import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.function.Consumer;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
@@ -36,7 +37,7 @@ final class ChatStorage extends SQLiteOpenHelper {
     private final Context context;
     private final SharedPreferences preferences;
     private final ChatFiles files;
-    private final ExecutorService maintenance = Executors.newSingleThreadExecutor();
+    private final ExecutorService executor = Executors.newSingleThreadExecutor();
     private boolean maintenanceQueued;
     private boolean opened;
 
@@ -50,7 +51,7 @@ final class ChatStorage extends SQLiteOpenHelper {
         super(context, NAME, 1, new SQLiteDatabase.OpenParams.Builder()
             .setErrorHandler(db -> Log.e(TAG, "Chat database is corrupt"))
             .setJournalMode("WAL")
-            .setSynchronousMode("FULL")
+            .setSynchronousMode("NORMAL")
             .build());
         this.context = context;
         preferences = context.getSharedPreferences("chat-storage", Context.MODE_PRIVATE);
@@ -133,7 +134,54 @@ final class ChatStorage extends SQLiteOpenHelper {
         }
     }
 
-    synchronized InputStream openAttachment(String token) throws IOException {
+    void requestAsync(Object owner, String method, String payload, Consumer<String> callback) {
+        executor.execute(() -> callback.accept(request(owner, method, payload)));
+    }
+
+    void writeSessionAsync(Object owner, String metaJson, String sessionJson,
+            Consumer<String> callback) {
+        executor.execute(() -> callback.accept(writeSessionRaw(owner, metaJson, sessionJson)));
+    }
+
+    void disconnectAsync(Object owner) {
+        executor.execute(() -> disconnect(owner));
+    }
+
+    synchronized String writeSessionRaw(Object owner, String metaJson, String sessionJson) {
+        try {
+            JSONObject args = new JSONObject(metaJson);
+            SQLiteDatabase db = database();
+            State state = state(db);
+            int slot = state.slot();
+            String token = args.optString("token");
+            if (!token.isEmpty() && !token.equals(state.token())) {
+                throw new IllegalStateException("History staging was replaced");
+            }
+            int target = token.isEmpty() ? slot : state.staged();
+            boolean migrating = state.legacy() == MIGRATION_PENDING;
+            if (migrating && token.isEmpty()) {
+                throw new IllegalStateException("Legacy history migration is pending");
+            }
+            JSONArray attachments = args.getJSONArray("files");
+            List<String> objects = prepareAttachments(owner, attachments);
+            boolean overrideFiles = args.optBoolean("overrideFiles");
+            boolean add = args.optBoolean("add");
+            JSONObject summary = args.getJSONObject("summary");
+            transaction(db, () -> {
+                writeAttachmentRows(db, target, attachments, overrideFiles);
+                writeSessionRow(db, target, summary, sessionJson, add);
+                if (token.isEmpty()) bumpRevision(db);
+            });
+            for (String object : objects) files.committed(object);
+            if (!objects.isEmpty()) scheduleMaintenance(false);
+            return "{\"value\":null}";
+        } catch (Exception error) {
+            Log.e(TAG, "writeSession failed (" + error.getClass().getSimpleName() + ")");
+            return "{\"error\":\"Android chat storage operation failed\"}";
+        }
+    }
+
+    InputStream openAttachment(String token) throws IOException {
         return files.open(token);
     }
 
@@ -329,10 +377,7 @@ final class ChatStorage extends SQLiteOpenHelper {
         return types;
     }
 
-    private void write(SQLiteDatabase db, Object owner, int slot, String token, JSONObject args)
-            throws Exception {
-        JSONArray attachments = args.getJSONArray("files");
-        JSONArray sessions = args.getJSONArray("sessions");
+    private List<String> prepareAttachments(Object owner, JSONArray attachments) throws Exception {
         List<String> objects = new ArrayList<>();
         for (int i = 0; i < attachments.length(); i++) {
             String object = attachments.getJSONObject(i).getString("object");
@@ -340,36 +385,52 @@ final class ChatStorage extends SQLiteOpenHelper {
             objects.add(object);
         }
         if (!objects.isEmpty()) files.syncDirectory();
-        transaction(db, () -> {
-            for (int i = 0; i < attachments.length(); i++) {
-                JSONObject file = attachments.getJSONObject(i);
-                String id = file.getString("id");
-                ContentValues values = new ContentValues();
-                values.put("type", file.getString("type"));
-                values.put("object", file.getString("object"));
-                values.put("override", args.optBoolean("overrideFiles") ? 1 : 0);
-                if (db.update("files", values, "slot=? AND id=?", keys(slot, id)) == 0) {
-                    values.put("slot", slot);
-                    values.put("id", id);
-                    db.insertOrThrow("files", null, values);
-                }
+        return objects;
+    }
+
+    private static void writeAttachmentRows(SQLiteDatabase db, int slot, JSONArray attachments,
+            boolean overrideFiles) throws Exception {
+        for (int i = 0; i < attachments.length(); i++) {
+            JSONObject file = attachments.getJSONObject(i);
+            String id = file.getString("id");
+            ContentValues values = new ContentValues();
+            values.put("type", file.getString("type"));
+            values.put("object", file.getString("object"));
+            values.put("override", overrideFiles ? 1 : 0);
+            if (db.update("files", values, "slot=? AND id=?", keys(slot, id)) == 0) {
+                values.put("slot", slot);
+                values.put("id", id);
+                db.insertOrThrow("files", null, values);
             }
+        }
+    }
+
+    private void write(SQLiteDatabase db, Object owner, int slot, String token, JSONObject args)
+            throws Exception {
+        JSONArray attachments = args.getJSONArray("files");
+        JSONArray sessions = args.getJSONArray("sessions");
+        List<String> objects = prepareAttachments(owner, attachments);
+        boolean overrideFiles = args.optBoolean("overrideFiles");
+        boolean add = args.optBoolean("add");
+        transaction(db, () -> {
+            writeAttachmentRows(db, slot, attachments, overrideFiles);
             for (int i = 0; i < sessions.length(); i++) {
-                writeSession(db, slot, sessions.getJSONObject(i), args.optBoolean("add"));
+                JSONObject row = sessions.getJSONObject(i);
+                writeSessionRow(db, slot, row, row.getString("data"), add);
             }
             if (token.isEmpty()) bumpRevision(db);
         });
         for (String object : objects) files.committed(object);
     }
 
-    private static void writeSession(SQLiteDatabase db, int slot, JSONObject row, boolean add)
-            throws Exception {
+    private static void writeSessionRow(SQLiteDatabase db, int slot, JSONObject row, String rawData,
+            boolean add) throws Exception {
         String id = row.getString("id");
         ContentValues values = new ContentValues();
         values.put("title", row.getString("title"));
         values.put("created", row.getDouble("createdAt"));
         values.put("updated", row.getDouble("updatedAt"));
-        values.put("data", row.getString("data").getBytes(StandardCharsets.UTF_8));
+        values.put("data", rawData.getBytes(StandardCharsets.UTF_8));
         if (add || db.update("sessions", values, "slot=? AND id=?", keys(slot, id)) == 0) {
             values.put("slot", slot);
             values.put("id", id);
@@ -427,7 +488,7 @@ final class ChatStorage extends SQLiteOpenHelper {
     private void scheduleMaintenance(boolean sweep) {
         if (maintenanceQueued) return;
         maintenanceQueued = true;
-        maintenance.execute(() -> {
+        executor.execute(() -> {
             synchronized (this) {
                 maintenanceQueued = false;
                 try {
