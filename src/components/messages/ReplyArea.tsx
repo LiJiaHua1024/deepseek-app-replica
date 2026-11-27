@@ -35,7 +35,7 @@ import { Tooltip } from '../base/Tooltip.js'
 import { Markdown } from '../markdown/Markdown.js'
 import { SiteThumbnails } from '../search/SiteLogo.js'
 import { toggleSearchPanel, useSearchPanel } from '../search/searchPanelState.js'
-import { useStopFollowing } from './scrollContext.js'
+import { findScrollContainer, useStopFollowing } from './scrollContext.js'
 import styles from './ReplyArea.module.css'
 import './thinking.markdown.css'
 
@@ -76,6 +76,11 @@ export const ReplyArea = memo(function ReplyArea({
   const [streamExpanded, setStreamExpanded] = useState(false)
   const [previewOverflow, setPreviewOverflow] = useState(false)
   const [retainPreview, setRetainPreview] = useState(false)
+  const [stuck, setStuck] = useState(false)
+  const [instantCollapse, setInstantCollapse] = useState(false)
+  const areaRef = useRef<HTMLDivElement>(null)
+  const sentinelRef = useRef<HTMLDivElement>(null)
+  const collapseScrollRef = useRef<{ scrollEl: HTMLElement; targetScrollTop: number } | null>(null)
   const previewRef = useRef<HTMLDivElement>(null)
   const stepsRef = useRef<HTMLDivElement>(null)
   const clipRef = useRef<HTMLDivElement>(null)
@@ -85,11 +90,57 @@ export const ReplyArea = memo(function ReplyArea({
   // 未记录请求开关时，按是否有思考内容显示标题。
   const thinking = message.thinking ?? view.steps.some((step) => step.type === 'thinking')
   const previewActive = Boolean(android && thinking && titleActive)
+  const title = thinking ? getAreaTitle(view, streaming, Date.now(), hasResponse) : null
+  const stickyHeader = Boolean(android && title && open && (!previewActive || streamExpanded))
   useTicker(titleActive, 1000)
 
   useLayoutEffect(() => {
     setInert(clipRef.current, !open)
   }, [open, view.steps.length])
+
+  useLayoutEffect(() => {
+    if (!open && collapseScrollRef.current) {
+      const { scrollEl, targetScrollTop } = collapseScrollRef.current
+      collapseScrollRef.current = null
+      scrollEl.scrollTop = targetScrollTop
+    }
+  }, [open])
+
+  useEffect(() => {
+    if (!stickyHeader) {
+      setStuck(false)
+      return
+    }
+    const sentinelEl = sentinelRef.current
+    const scrollEl = findScrollContainer(areaRef.current)
+    if (!sentinelEl || !scrollEl) {
+      setStuck(false)
+      return
+    }
+    const updateFallback = () => {
+      const sentinelRect = sentinelEl.getBoundingClientRect()
+      const scrollRect = scrollEl.getBoundingClientRect()
+      setStuck(sentinelRect.bottom <= scrollRect.top + 1)
+    }
+    if (typeof IntersectionObserver === 'undefined') {
+      updateFallback()
+      scrollEl.addEventListener('scroll', updateFallback, { passive: true })
+      return () => scrollEl.removeEventListener('scroll', updateFallback)
+    }
+    const observer = new IntersectionObserver(
+      (entries) => {
+        const entry = entries[0]
+        if (!entry) {
+          return
+        }
+        const rootTop = entry.rootBounds?.top ?? scrollEl.getBoundingClientRect().top
+        setStuck(!entry.isIntersecting && entry.boundingClientRect.top <= rootTop + 1)
+      },
+      { root: scrollEl, threshold: 0 }
+    )
+    observer.observe(sentinelEl)
+    return () => observer.disconnect()
+  }, [stickyHeader])
 
   useLayoutEffect(() => {
     const preview = previewRef.current
@@ -160,7 +211,6 @@ export const ReplyArea = memo(function ReplyArea({
   if (view.steps.length === 0 && (android || !(message.thinking && streaming))) {
     return null
   }
-  const title = thinking ? getAreaTitle(view, streaming, Date.now(), hasResponse) : null
   const stopped = !streaming && !hasResponse
   const compactPreview = (previewActive && !streamExpanded) || (!open && retainPreview)
   const toggle = () => {
@@ -170,10 +220,27 @@ export const ReplyArea = memo(function ReplyArea({
         setStreamExpanded(!streamExpanded)
       }
     } else {
-      if (android && !open) {
+      const nextOpen = !open
+      if (android && nextOpen) {
         stopFollowing()
+        setInstantCollapse(false)
+      } else if (android && !nextOpen && areaRef.current) {
+        const scrollEl = findScrollContainer(areaRef.current)
+        const overflowAbove = scrollEl
+          ? scrollEl.getBoundingClientRect().top - areaRef.current.getBoundingClientRect().top
+          : 0
+        if (scrollEl && overflowAbove > 1) {
+          stopFollowing()
+          collapseScrollRef.current = {
+            scrollEl,
+            targetScrollTop: Math.max(0, scrollEl.scrollTop - overflowAbove),
+          }
+          setInstantCollapse(true)
+        } else {
+          setInstantCollapse(false)
+        }
       }
-      setOverride(!open)
+      setOverride(nextOpen)
     }
   }
   const steps = view.steps.map((step, index) => (
@@ -187,10 +254,19 @@ export const ReplyArea = memo(function ReplyArea({
     />
   ))
   return (
-    <div className={styles.area} data-expanded={android && title && open ? '' : undefined}>
+    <div
+      ref={areaRef}
+      className={styles.area}
+      data-expanded={android && title && open ? '' : undefined}
+      data-sticky-header={stickyHeader ? '' : undefined}
+    >
+      {stickyHeader ? (
+        <div ref={sentinelRef} className={styles.stickySentinel} aria-hidden="true" />
+      ) : null}
       {title ? (
         <div
           className={styles.title}
+          data-stuck={stuck ? 'true' : undefined}
           role="button"
           tabIndex={0}
           aria-expanded={previewActive ? !previewOverflow || streamExpanded : open}
@@ -233,7 +309,12 @@ export const ReplyArea = memo(function ReplyArea({
         </div>
       ) : null}
       {android && title ? (
-        <div className={styles.disclosure} data-open={open} aria-hidden={!open}>
+        <div
+          className={styles.disclosure}
+          data-open={open}
+          data-instant={instantCollapse ? 'true' : undefined}
+          aria-hidden={!open}
+        >
           <div ref={clipRef} className={styles.disclosureClip}>
             <div
               ref={previewRef}
