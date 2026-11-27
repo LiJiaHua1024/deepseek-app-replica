@@ -41,7 +41,7 @@ final class ChatFiles {
     synchronized void append(Object owner, String token, String data) throws IOException {
         Upload upload = uploads.get(token);
         if (upload == null || upload.owner() != owner || upload.stream() == null
-                || data.length() > 350_000) {
+                || data.length() > 1_048_576) {
             throw new IOException("Invalid attachment upload");
         }
         upload.stream().write(Base64.decode(data, Base64.NO_WRAP));

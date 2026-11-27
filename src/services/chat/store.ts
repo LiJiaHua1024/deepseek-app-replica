@@ -46,7 +46,7 @@ import {
 } from './contextSummary.js'
 import { prepareCustomAttachments } from './customAttachments.js'
 import * as db from './db.js'
-import type { MigrationNotice } from './androidStorage.js'
+import type { MigrationNotice, MigrationProgress } from './androidStorage.js'
 import {
   cancelMessageEdit,
   clearAllDrafts,
@@ -135,6 +135,7 @@ type ChatState = {
   pendingJump: PendingMessageJump | null
   /** 正在生成回复的会话 */
   streaming: Record<string, AbortController>
+  migrationProgress: MigrationProgress | null
   storageAlert: TranslationMessage | null
 }
 
@@ -149,6 +150,7 @@ export const useChatStore = create<ChatState>(() => ({
   activeId: null,
   pendingJump: null,
   streaming: {},
+  migrationProgress: null,
   storageAlert: null,
 }))
 
@@ -372,6 +374,9 @@ if (typeof window !== 'undefined') {
           : { key: 'storageMigrationRecovered', params: { count: recovered } },
     })
   })
+  window.addEventListener('chat-storage-migration-progress', (event) => {
+    set({ migrationProgress: (event as CustomEvent<MigrationProgress | null>).detail ?? null })
+  })
 }
 
 export const initChat = (): Promise<void> => {
@@ -382,16 +387,16 @@ export const initChat = (): Promise<void> => {
     return initTask
   }
   const epoch = historyEpoch
-  set({ initError: false })
+  set({ initError: false, migrationProgress: null })
   initTask = (async () => {
     try {
       const summaries = await db.loadSessionSummaries()
       if (epoch === historyEpoch) {
-        set({ ready: true, sessions: sortSessions(summaries) })
+        set({ ready: true, migrationProgress: null, sessions: sortSessions(summaries) })
       }
     } catch (error) {
       if (epoch === historyEpoch) {
-        set({ initError: true })
+        set({ initError: true, migrationProgress: null })
         db.reportStorageError('read local sessions')(error)
       }
     } finally {

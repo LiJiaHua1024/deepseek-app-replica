@@ -37,6 +37,7 @@ export type AndroidBridge = {
   finishHistoryExport: () => boolean
   chatStorage?: (method: string, payload: string) => string
   chatStorageAsync?: (id: string, method: string, payload: string) => void
+  chatStorageAppendAsync?: (id: string, object: string, data: string) => void
   chatStorageWriteSessionAsync?: (id: string, metaJson: string, sessionJson: string) => void
   shadowList?: (dir: 'sessions' | 'files') => string | null
   shadowReadChunk?: (path: string, offset: number) => string | null

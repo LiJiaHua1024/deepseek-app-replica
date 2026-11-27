@@ -127,7 +127,7 @@ final class ChatStorage extends SQLiteOpenHelper {
         try {
             Object result = execute(owner, method, new JSONObject(payload));
             return new JSONObject().put("value", result == null ? JSONObject.NULL : result).toString();
-        } catch (Exception error) {
+        } catch (Throwable error) {
             // Exceptions may include bound chat data. Log the operation and exception type only.
             Log.e(TAG, method + " failed (" + error.getClass().getSimpleName() + ")");
             return "{\"error\":\"Android chat storage operation failed\"}";
@@ -138,13 +138,33 @@ final class ChatStorage extends SQLiteOpenHelper {
         executor.execute(() -> callback.accept(request(owner, method, payload)));
     }
 
+    void appendAsync(Object owner, String object, String data, Consumer<String> callback) {
+        executor.execute(() -> callback.accept(appendRaw(owner, object, data)));
+    }
+
     void writeSessionAsync(Object owner, String metaJson, String sessionJson,
             Consumer<String> callback) {
         executor.execute(() -> callback.accept(writeSessionRaw(owner, metaJson, sessionJson)));
     }
 
     void disconnectAsync(Object owner) {
-        executor.execute(() -> disconnect(owner));
+        executor.execute(() -> {
+            try {
+                disconnect(owner);
+            } catch (Throwable error) {
+                Log.e(TAG, "disconnect failed (" + error.getClass().getSimpleName() + ")");
+            }
+        });
+    }
+
+    synchronized String appendRaw(Object owner, String object, String data) {
+        try {
+            files.append(owner, object, data);
+            return "{\"value\":null}";
+        } catch (Throwable error) {
+            Log.e(TAG, "append failed (" + error.getClass().getSimpleName() + ")");
+            return "{\"error\":\"Android chat storage operation failed\"}";
+        }
     }
 
     synchronized String writeSessionRaw(Object owner, String metaJson, String sessionJson) {
@@ -175,7 +195,7 @@ final class ChatStorage extends SQLiteOpenHelper {
             for (String object : objects) files.committed(object);
             if (!objects.isEmpty()) scheduleMaintenance(false);
             return "{\"value\":null}";
-        } catch (Exception error) {
+        } catch (Throwable error) {
             Log.e(TAG, "writeSession failed (" + error.getClass().getSimpleName() + ")");
             return "{\"error\":\"Android chat storage operation failed\"}";
         }
@@ -333,7 +353,8 @@ final class ChatStorage extends SQLiteOpenHelper {
             }
         }
         for (JSONObject item : longTitles) {
-            item.put("title", readText(db, slot, item.getString("id"), "CAST(title AS BLOB)"));
+            String title = readText(db, slot, item.getString("id"), "CAST(title AS BLOB)");
+            item.put("title", title == null ? "" : title);
         }
         return summaries;
     }
@@ -351,6 +372,7 @@ final class ChatStorage extends SQLiteOpenHelper {
                     new String[]{String.valueOf(offset), String.valueOf(slot), id})) {
                 if (!cursor.moveToFirst()) return null;
                 byte[] chunk = cursor.getBlob(0);
+                if (chunk == null) return "";
                 bytes.write(chunk);
                 if (chunk.length < TEXT_CHUNK) return new String(bytes.toByteArray(), StandardCharsets.UTF_8);
             }
@@ -445,7 +467,7 @@ final class ChatStorage extends SQLiteOpenHelper {
         JSONArray refs = row.optJSONArray("fileIds");
         if (refs != null) {
             for (int i = 0; i < refs.length(); i++) {
-                db.execSQL("INSERT INTO refs VALUES (?,?,?)", new Object[]{slot, id, refs.getString(i)});
+                db.execSQL("INSERT OR IGNORE INTO refs VALUES (?,?,?)", new Object[]{slot, id, refs.getString(i)});
             }
         }
     }
@@ -510,7 +532,7 @@ final class ChatStorage extends SQLiteOpenHelper {
                     State state = state(db);
                     boolean retiring = state.token() == null && clearRetiredBatch(db, state.staged());
                     if (collectGarbage(db) || retiring) scheduleMaintenance(false);
-                } catch (Exception error) {
+                } catch (Throwable error) {
                     Log.w(TAG, "Attachment cleanup will be retried", error);
                 }
             }

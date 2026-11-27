@@ -1,5 +1,5 @@
 import type { AndroidBridge } from '../../app/android.js'
-import { readBlobChunks } from '../../utils/blob.js'
+import { readBlobBase64 } from '../../utils/blob.js'
 import { mergeSessions } from './history/mergeSessions.js'
 import { deleteLegacyHistory, openLegacyHistory } from './indexedDb.js'
 import {
@@ -33,6 +33,8 @@ type ChatStorageReplyEvent = {
 
 let requestSeq = 0
 const pendingRequests = new Map<string, PendingRequest>()
+const ASYNC_TIMEOUT_MS = 60_000
+const LEGACY_READ_TIMEOUT_MS = 15_000
 
 if (device?.chatStorageAsync && typeof globalThis.addEventListener === 'function') {
   globalThis.addEventListener('android-chat-storage', (event: Event) => {
@@ -56,14 +58,27 @@ if (device?.chatStorageAsync && typeof globalThis.addEventListener === 'function
 const dispatchAsync = <Result>(method: string, call: (id: string) => void): Promise<Result> =>
   new Promise<Result>((resolve, reject) => {
     const id = String(++requestSeq)
+    const timer = setTimeout(() => {
+      if (!pendingRequests.delete(id)) {
+        return
+      }
+      reject(new Error(`${method}: timed out`))
+    }, ASYNC_TIMEOUT_MS)
     pendingRequests.set(id, {
       method,
-      resolve: resolve as (value: unknown) => void,
-      reject,
+      resolve: (value) => {
+        clearTimeout(timer)
+        resolve(value as Result)
+      },
+      reject: (error) => {
+        clearTimeout(timer)
+        reject(error)
+      },
     })
     try {
       call(id)
     } catch (error) {
+      clearTimeout(timer)
       pendingRequests.delete(id)
       reject(error instanceof Error ? error : new Error(String(error)))
     }
@@ -87,7 +102,7 @@ const request = async <Result = unknown>(method: string, payload: object = {}): 
 }
 
 const pause = () => new Promise<void>((resolve) => setTimeout(resolve, 0))
-const CHUNK_SIZE = 32 * 1024
+const CHUNK_SIZE = 384 * 1024
 
 const decode = (base64: string) => {
   const binary = atob(base64)
@@ -99,35 +114,47 @@ const decode = (base64: string) => {
 }
 
 type UploadedFile = { id: string; object: string; type: string }
+type SerializedSession = { session: Session; data: string }
 
 const write = async ({
   token,
   sessions = [],
+  serializedSessions,
   files = [],
   add = false,
   overrideFiles = false,
+  blobTimeoutMs,
 }: {
   token?: string
   sessions?: Session[]
+  serializedSessions?: SerializedSession[]
   files?: StoredFile[]
   add?: boolean
   overrideFiles?: boolean
+  blobTimeoutMs?: number
 } = {}) => {
   const uploads: UploadedFile[] = []
   try {
+    const appendAsync = device?.chatStorageAppendAsync
     for (const { id, blob } of files) {
       const object = await request<string>('upload', { token })
       uploads.push({ id, object, type: blob.type })
-      for await (const chunk of readBlobChunks(blob)) {
-        for (let offset = 0; offset < chunk.length; offset += CHUNK_SIZE) {
-          const data = btoa(String.fromCharCode(...chunk.subarray(offset, offset + CHUNK_SIZE)))
+      for (let offset = 0; offset < blob.size; offset += CHUNK_SIZE) {
+        const data = await readBlobBase64(blob.slice(offset, offset + CHUNK_SIZE), blobTimeoutMs)
+        if (appendAsync) {
+          await dispatchAsync<null>('append', (requestId) =>
+            appendAsync.call(device, requestId, object, data)
+          )
+        } else {
           await request('append', { object, data })
         }
       }
     }
+    const rows: SerializedSession[] =
+      serializedSessions ?? sessions.map((session) => ({ session, data: JSON.stringify(session) }))
     const writeSessionAsync = device?.chatStorageWriteSessionAsync
-    if (sessions.length === 1 && writeSessionAsync) {
-      const session = sessions[0]
+    if (rows.length === 1 && writeSessionAsync) {
+      const { session, data } = rows[0]
       const metaJson = JSON.stringify({
         token,
         files: uploads,
@@ -135,17 +162,16 @@ const write = async ({
         add,
         overrideFiles,
       })
-      const sessionJson = JSON.stringify(session)
       await dispatchAsync<null>('write', (id) =>
-        writeSessionAsync.call(device, id, metaJson, sessionJson)
+        writeSessionAsync.call(device, id, metaJson, data)
       )
     } else {
       await request('write', {
         token,
         files: uploads,
-        sessions: sessions.map((session) => ({
+        sessions: rows.map(({ session, data }) => ({
           ...storedSummary(session),
-          data: JSON.stringify(session),
+          data,
         })),
         add,
         overrideFiles,
@@ -161,6 +187,90 @@ const write = async ({
     }
     throw error
   }
+}
+
+const MAX_SESSION_BATCH_COUNT = 32
+const MAX_SESSION_BATCH_BYTES = 1024 * 1024
+const SINGLE_SESSION_THRESHOLD = 512 * 1024
+
+const writeSessionBatches = async <Item extends SerializedSession>({
+  token,
+  items,
+  add = false,
+  pauseBetweenBatches = false,
+  onSuccess,
+  onError,
+}: {
+  token?: string
+  items: Item[]
+  add?: boolean
+  pauseBetweenBatches?: boolean
+  onSuccess?: (item: Item) => void
+  onError?: (item: Item, error: unknown) => void
+}) => {
+  let batch: Item[] = []
+  let batchBytes = 0
+
+  const writeSingle = async (item: Item) => {
+    try {
+      await write({ token, serializedSessions: [item], add })
+      onSuccess?.(item)
+    } catch (error) {
+      if (!onError) {
+        throw error
+      }
+      onError(item, error)
+    }
+  }
+
+  const flush = async () => {
+    if (!batch.length) {
+      return
+    }
+    const current = batch
+    batch = []
+    batchBytes = 0
+    try {
+      await write({ token, serializedSessions: current, add })
+      for (const item of current) {
+        onSuccess?.(item)
+      }
+    } catch (batchError) {
+      if (current.length === 1) {
+        if (!onError) {
+          throw batchError
+        }
+        onError(current[0], batchError)
+      } else {
+        for (const item of current) {
+          await writeSingle(item)
+        }
+      }
+    }
+    if (pauseBetweenBatches) {
+      await pause()
+    }
+  }
+
+  for (const item of items) {
+    if (item.data.length >= SINGLE_SESSION_THRESHOLD) {
+      await flush()
+      await writeSingle(item)
+      if (pauseBetweenBatches) {
+        await pause()
+      }
+      continue
+    }
+    if (
+      batch.length >= MAX_SESSION_BATCH_COUNT ||
+      (batch.length > 0 && batchBytes + item.data.length >= MAX_SESSION_BATCH_BYTES)
+    ) {
+      await flush()
+    }
+    batch.push(item)
+    batchBytes += item.data.length
+  }
+  await flush()
 }
 
 const readSession = async (id: string, token?: string): Promise<Session | undefined> => {
@@ -286,9 +396,57 @@ const readMirrorSession = (id: string): Session | undefined => {
 }
 
 export type MigrationNotice = { recovered: number; missing: number; unverified: number }
+export type MigrationProgress =
+  | { stage: 'reading' }
+  | { stage: 'sessions'; done: number; total: number }
+  | { stage: 'files'; done: number; total: number }
+  | { stage: 'finalizing' }
+
+const emitMigrationProgress = (progress: MigrationProgress | null) => {
+  if (typeof globalThis.dispatchEvent === 'function') {
+    globalThis.dispatchEvent(
+      new CustomEvent('chat-storage-migration-progress', { detail: progress })
+    )
+  }
+}
+
+const withTimeout = <Result>(
+  promise: Promise<Result>,
+  ms: number,
+  message: string
+): Promise<Result> => {
+  promise.catch(() => {})
+  let timer: ReturnType<typeof setTimeout> | undefined
+  return Promise.race([
+    promise,
+    new Promise<Result>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(message)), ms)
+    }),
+  ]).finally(() => {
+    if (timer !== undefined) {
+      clearTimeout(timer)
+    }
+  })
+}
+
+const isConnectionError = (error: unknown, legacyClosed?: boolean) =>
+  Boolean(legacyClosed) ||
+  (error instanceof DOMException &&
+    (error.name === 'InvalidStateError' || error.name === 'TransactionInactiveError'))
 
 const migrate = async () => {
-  const legacy = await openLegacyHistory()
+  let readingShown = false
+  const readingTimer = setTimeout(() => {
+    readingShown = true
+    emitMigrationProgress({ stage: 'reading' })
+  }, 300)
+  const legacy = await openLegacyHistory().catch((error: unknown) => {
+    clearTimeout(readingTimer)
+    if (readingShown) {
+      emitMigrationProgress(null)
+    }
+    throw error
+  })
   const notice: MigrationNotice = { recovered: 0, missing: 0, unverified: 0 }
   let token: string | undefined
   try {
@@ -297,6 +455,7 @@ const migrate = async () => {
     const indexedIds = new Set([...sessionIds, ...((await legacy?.summaryIds()) ?? [])])
     const mirrorSessions = new Set(mirrorIds('sessions'))
     const mirrorFiles = new Set(mirrorIds('files'))
+    clearTimeout(readingTimer)
     const useMirrorList = indexedIds.size === 0
     const ids = useMirrorList ? mirrorSessions : indexedIds
     // An intact legacy index is authoritative for presence. A mirror-only record might
@@ -307,9 +466,22 @@ const migrate = async () => {
 
     token = await request<string>('begin', { migration: true })
     const referenced = new Map<string, string>()
+    const writtenIds = new Set<string>()
     let failedFiles = 0
-    let batch: { session: Session; recovered: boolean }[] = []
-    let batchBytes = 0
+    let migratedSessions = 0
+    let sessionsDone = 0
+    let lastProgressAt = 0
+
+    const reportSessionProgress = (force = false) => {
+      if (!ids.size) {
+        return
+      }
+      const now = performance.now()
+      if (force || now - lastProgressAt >= 150) {
+        lastProgressAt = now
+        emitMigrationProgress({ stage: 'sessions', done: sessionsDone, total: ids.size })
+      }
+    }
 
     const recordReferences = (session: Session) => {
       for (const message of session.messages) {
@@ -323,108 +495,247 @@ const migrate = async () => {
       }
     }
 
-    const flushSessions = async () => {
-      if (!batch.length) {
-        return
-      }
-      const current = batch
-      batch = []
-      batchBytes = 0
-      try {
-        await write({
-          token,
-          sessions: current.map((item) => item.session),
-          add: true,
-        })
-        for (const item of current) {
-          recordReferences(item.session)
-          if (item.recovered) {
-            notice.recovered += 1
+    if (ids.size > 0) {
+      reportSessionProgress(true)
+    }
+
+    const idList = [...ids]
+    const readChunkSize = MAX_SESSION_BATCH_COUNT
+    for (let i = 0; i < idList.length; i += readChunkSize) {
+      const chunkIds = idList.slice(i, i + readChunkSize)
+      const indexedChunk = new Map<string, Session | undefined>()
+      const neededIds = chunkIds.filter((id) => sessionIds.has(id))
+      if (legacy && neededIds.length > 0) {
+        try {
+          const rows = await withTimeout(
+            legacy.sessions(neededIds),
+            LEGACY_READ_TIMEOUT_MS,
+            'Timed out reading legacy chat batch'
+          )
+          neededIds.forEach((id, index) => {
+            indexedChunk.set(id, sanitizeLegacySession(id, rows[index]))
+          })
+        } catch (batchReadError) {
+          if (isConnectionError(batchReadError, legacy.isClosed())) {
+            throw batchReadError
+          }
+          for (const id of neededIds) {
+            try {
+              const row = await withTimeout(
+                legacy.session(id),
+                LEGACY_READ_TIMEOUT_MS,
+                `Timed out reading legacy chat: ${id}`
+              )
+              indexedChunk.set(id, sanitizeLegacySession(id, row))
+            } catch (error) {
+              if (isConnectionError(error, legacy.isClosed())) {
+                throw error
+              }
+              reportStorageError('read legacy session')(error)
+            }
           }
         }
-      } catch {
-        for (const item of current) {
-          try {
-            await write({ token, sessions: [item.session], add: true })
+      }
+
+      const items: (SerializedSession & { recovered: boolean })[] = []
+      for (const id of chunkIds) {
+        let recovered = false
+        let session = indexedChunk.get(id)
+        if (!session && mirrorSessions.has(id)) {
+          session = readMirrorSession(id)
+          recovered = Boolean(session)
+        }
+        if (!session) {
+          notice.missing += 1
+          sessionsDone += 1
+          continue
+        }
+        if (writtenIds.has(session.id)) {
+          if (!writtenIds.has(id)) {
+            session = { ...session, id }
+          } else {
+            sessionsDone += 1
+            continue
+          }
+        }
+        writtenIds.add(session.id)
+        items.push({ session, data: JSON.stringify(session), recovered })
+      }
+
+      if (items.length > 0) {
+        await writeSessionBatches({
+          token,
+          items,
+          add: true,
+          pauseBetweenBatches: true,
+          onSuccess: (item) => {
             recordReferences(item.session)
+            migratedSessions += 1
+            sessionsDone += 1
             if (item.recovered) {
               notice.recovered += 1
             }
-          } catch (error) {
+          },
+          onError: (_item, error) => {
             reportStorageError('migrate legacy session')(error)
             notice.missing += 1
-          }
-        }
+            sessionsDone += 1
+          },
+        })
       }
+      reportSessionProgress(i + readChunkSize >= idList.length)
       await pause()
     }
 
-    for (const id of ids) {
-      let indexed: Session | undefined
-      if (sessionIds.has(id)) {
-        try {
-          indexed = sanitizeLegacySession(id, await legacy?.session(id))
-        } catch (error) {
-          reportStorageError('read legacy session')(error)
-        }
+    if (ids.size > 0 && migratedSessions === 0) {
+      throw new Error('Unable to read any legacy chats during migration')
+    }
+
+    const mirrorOnlyFiles = [...mirrorFiles].filter(
+      (id) => !indexedFiles.has(id) && (useMirrorList || referenced.has(id))
+    )
+    const totalFiles = indexedFiles.size + mirrorOnlyFiles.length
+    let filesDone = 0
+    const MAX_FILE_BATCH_COUNT = 16
+    const MAX_FILE_BATCH_BYTES = 4 * 1024 * 1024
+    let fileBatch: { file: StoredFile; fromMirror: boolean }[] = []
+    let fileBatchBytes = 0
+
+    const reportFileProgress = (force = false) => {
+      if (!totalFiles) {
+        return
       }
-      let recovered = false
-      let session = indexed
-      if (!session && mirrorSessions.has(id)) {
-        session = readMirrorSession(id)
-        recovered = Boolean(session)
-      }
-      if (!session) {
-        notice.missing += 1
-        continue
-      }
-      batch.push({ session, recovered })
-      batchBytes += JSON.stringify(session).length
-      if (batch.length >= 32 || batchBytes >= 2 * 1024 * 1024) {
-        await flushSessions()
+      const now = performance.now()
+      if (force || now - lastProgressAt >= 150) {
+        lastProgressAt = now
+        emitMigrationProgress({ stage: 'files', done: filesDone, total: totalFiles })
       }
     }
-    await flushSessions()
+
+    const writeSingleFile = async (item: StoredFile, fromMirror: boolean) => {
+      try {
+        await write({ token, files: [item], blobTimeoutMs: LEGACY_READ_TIMEOUT_MS })
+      } catch (error) {
+        if (!fromMirror && mirrorFiles.has(item.id)) {
+          try {
+            const blob = new Blob(readMirror(`files/${item.id}.bin`), {
+              type: item.blob.type || referenced.get(item.id) || '',
+            })
+            await write({
+              token,
+              files: [{ id: item.id, blob }],
+              blobTimeoutMs: LEGACY_READ_TIMEOUT_MS,
+            })
+            return
+          } catch (mirrorError) {
+            reportStorageError('migrate legacy attachment from mirror')(mirrorError)
+          }
+        }
+        reportStorageError('migrate legacy attachment')(error)
+        failedFiles += 1
+      }
+    }
+
+    const flushFiles = async () => {
+      if (!fileBatch.length) {
+        return
+      }
+      const current = fileBatch
+      fileBatch = []
+      fileBatchBytes = 0
+      try {
+        await write({
+          token,
+          files: current.map((entry) => entry.file),
+          blobTimeoutMs: LEGACY_READ_TIMEOUT_MS,
+        })
+      } catch (batchError) {
+        if (current.length === 1) {
+          await writeSingleFile(current[0].file, current[0].fromMirror)
+        } else {
+          reportStorageError('migrate legacy attachment batch')(batchError)
+          for (const entry of current) {
+            await writeSingleFile(entry.file, entry.fromMirror)
+          }
+        }
+      }
+      filesDone += current.length
+      reportFileProgress(filesDone >= totalFiles)
+      await pause()
+    }
+
+    const enqueueFile = async (file: StoredFile, fromMirror: boolean) => {
+      if (file.blob.size >= MAX_FILE_BATCH_BYTES) {
+        await flushFiles()
+        await writeSingleFile(file, fromMirror)
+        filesDone += 1
+        reportFileProgress(filesDone >= totalFiles)
+        await pause()
+        return
+      }
+      if (
+        fileBatch.length >= MAX_FILE_BATCH_COUNT ||
+        (fileBatch.length > 0 && fileBatchBytes + file.blob.size >= MAX_FILE_BATCH_BYTES)
+      ) {
+        await flushFiles()
+      }
+      fileBatch.push({ file, fromMirror })
+      fileBatchBytes += file.blob.size
+    }
+
+    if (totalFiles > 0) {
+      reportFileProgress(true)
+    }
 
     for (const id of indexedFiles) {
-      try {
-        let file: StoredFile | undefined
+      let file: StoredFile | undefined
+      let fromMirror = false
+      if (legacy) {
         try {
-          const original = await legacy?.file(id)
+          const original = await withTimeout(
+            legacy.file(id),
+            LEGACY_READ_TIMEOUT_MS,
+            `Timed out reading legacy attachment: ${id}`
+          )
           if (original?.blob && typeof original.blob.size === 'number') {
             file = original
           }
         } catch (error) {
+          if (isConnectionError(error, legacy.isClosed())) {
+            throw error
+          }
           reportStorageError('read legacy attachment')(error)
         }
-        if (!file && mirrorFiles.has(id)) {
-          const blob = new Blob(readMirror(`files/${id}.bin`), { type: referenced.get(id) ?? '' })
-          file = { id, blob }
-        }
-        if (!file) {
-          failedFiles += 1
-          continue
-        }
-        await write({ token, files: [file] })
-      } catch (error) {
-        reportStorageError('migrate legacy attachment')(error)
+      }
+      if (!file && mirrorFiles.has(id)) {
+        const blob = new Blob(readMirror(`files/${id}.bin`), { type: referenced.get(id) ?? '' })
+        file = { id, blob }
+        fromMirror = true
+      }
+      if (!file) {
         failedFiles += 1
+        filesDone += 1
+        reportFileProgress()
+        continue
       }
-      await pause()
+      await enqueueFile(file, fromMirror)
     }
-    for (const id of mirrorFiles) {
-      if (!indexedFiles.has(id) && (useMirrorList || referenced.has(id))) {
-        try {
-          const blob = new Blob(readMirror(`files/${id}.bin`), { type: referenced.get(id) ?? '' })
-          await write({ token, files: [{ id, blob }] })
-        } catch (error) {
-          reportStorageError('migrate mirror attachment')(error)
-          failedFiles += 1
-        }
-        await pause()
+    for (const id of mirrorOnlyFiles) {
+      try {
+        const blob = new Blob(readMirror(`files/${id}.bin`), { type: referenced.get(id) ?? '' })
+        await enqueueFile({ id, blob }, true)
+      } catch (error) {
+        reportStorageError('migrate mirror attachment')(error)
+        failedFiles += 1
+        filesDone += 1
+        reportFileProgress()
       }
     }
+    await flushFiles()
 
+    if (ids.size > 0 || totalFiles > 0) {
+      emitMigrationProgress({ stage: 'finalizing' })
+    }
     // This SQLite transaction publishes both stores and the one-time migration marker.
     const retainLegacy = notice.missing > 0 || notice.unverified > 0 || failedFiles > 0
     await request('replace', { token, retainLegacy })
@@ -438,6 +749,8 @@ const migrate = async () => {
     }
     throw error
   } finally {
+    clearTimeout(readingTimer)
+    emitMigrationProgress(null)
     legacy?.close()
   }
   if (notice.recovered || notice.missing || notice.unverified) {
@@ -445,18 +758,36 @@ const migrate = async () => {
   }
 }
 
-const retireLegacy = async () => {
-  try {
-    if (await request<boolean>('canRetire')) {
-      await pause()
-      await deleteLegacyHistory()
-      if (!device?.shadowClearAll?.()) {
-        throw new Error('Unable to remove the legacy Android mirror')
+let retireTask: Promise<void> | undefined
+
+const retireLegacy = () => {
+  if (retireTask) {
+    return retireTask
+  }
+  retireTask = (async () => {
+    try {
+      if (await request<boolean>('canRetire')) {
+        await pause()
+        await deleteLegacyHistory()
+        if (!device?.shadowClearAll?.()) {
+          throw new Error('Unable to remove the legacy Android mirror')
+        }
+        await request('retired')
       }
-      await request('retired')
+    } catch (error) {
+      reportStorageError('retire migrated history')(error)
+    } finally {
+      retireTask = undefined
     }
-  } catch (error) {
-    reportStorageError('retire migrated history')(error)
+  })()
+  return retireTask
+}
+
+const scheduleRetireLegacy = () => {
+  if (!retireTask) {
+    setTimeout(() => {
+      void retireLegacy()
+    }, 0)
   }
 }
 
@@ -469,7 +800,7 @@ const initialize = async () => {
     await migrate()
   }
   initialized = true
-  await retireLegacy()
+  scheduleRetireLegacy()
 }
 
 // File uploads yield while reading blobs. Keep write ordering across those yields,
@@ -566,7 +897,13 @@ export const stagingWriter = (token: string): StagingWriter => {
     summaries,
     getActiveFileTypes: (ids) => run(() => readFileTypes(ids, token)),
     async addSessions(sessions) {
-      await run(() => write({ token, sessions, add: true }))
+      await run(() =>
+        writeSessionBatches({
+          token,
+          items: sessions.map((session) => ({ session, data: JSON.stringify(session) })),
+          add: true,
+        })
+      )
       for (const session of sessions) {
         summaries.push(toSessionSummary(session))
       }
@@ -591,7 +928,7 @@ export const beginStaging = async (): Promise<HistoryStaging> => {
     commit: () =>
       run(async () => {
         await request('replace', { token })
-        await retireLegacy()
+        scheduleRetireLegacy()
       }),
     discard: () =>
       run(async () => {
